@@ -207,8 +207,8 @@ public enum VideoDedupeEngine {
         let bestID = sortedByQuality.first?.localIdentifier ?? videos[0].localIdentifier
         
         let items: [DedupeAssetItem] = videos.map { asset in
-            let record = sizeRecords[asset.localIdentifier]
-            let total = record?.totalBytes ?? Int64(asset.duration * 2_500_000)
+            let record = sizeRecords[asset.localIdentifier] ?? StorageCalculator.resolveExactSize(for: asset)
+            let total = record.totalBytes
             let isBest = asset.localIdentifier == bestID
             
             return DedupeAssetItem(

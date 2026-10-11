@@ -249,10 +249,10 @@ public enum PhotoDedupeEngine {
         let bestID = sortedByQuality.first?.localIdentifier ?? assets[0].localIdentifier
         
         let items: [DedupeAssetItem] = assets.map { asset in
-            let record = sizeRecords[asset.localIdentifier]
-            let total = record?.totalBytes ?? 2_500_000
-            let still = record?.stillBytes ?? total
-            let video = record?.videoBytes ?? 0
+            let record = sizeRecords[asset.localIdentifier] ?? StorageCalculator.resolveExactSize(for: asset)
+            let total = record.totalBytes
+            let still = record.stillBytes
+            let video = record.videoBytes
             let isBest = asset.localIdentifier == bestID
             
             return DedupeAssetItem(

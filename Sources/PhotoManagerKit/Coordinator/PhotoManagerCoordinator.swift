@@ -63,14 +63,14 @@ public final class PhotoManagerCoordinator: ObservableObject {
             return
         }
         
-        await fetchAssetsAndComputeInstantOverview()
+        await fetchAssetsAndComputeOverview()
         await startBackgroundPipelines()
         #endif
     }
     
     #if canImport(Photos)
-    /// Fetches all assets and renders instant storage estimates in < 50ms.
-    private func fetchAssetsAndComputeInstantOverview() async {
+    /// Fetches all assets and calculates storage overview strictly using KVC sizes.
+    private func fetchAssetsAndComputeOverview() async {
         isIndexing = true
         statusMessage = "Analyzing storage…"
         
@@ -96,9 +96,9 @@ public final class PhotoManagerCoordinator: ObservableObject {
         videoFetch.enumerateObjects { asset, _, _ in videos.append(asset) }
         self.allVideos = videos
         
-        // Instant < 50ms Storage Estimation
-        let instantStorage = StorageCalculator.computeInstantEstimate(photos: photos, videos: videos)
-        self.storageOverview = instantStorage
+        // Pure KVC Storage Overview (instant from cached KVC sizes)
+        let kvcStorage = StorageCalculator.computeOverview(photos: photos, videos: videos, sizeRecords: sizeRecords)
+        self.storageOverview = kvcStorage
         
         // Smart Albums
         self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: sizeRecords)
@@ -109,7 +109,7 @@ public final class PhotoManagerCoordinator: ObservableObject {
         self.oldPhotosAlbum = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
         self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
         
-        statusMessage = "Storage calculated (\(instantStorage.totalCount) items)"
+        statusMessage = "Storage calculated (\(kvcStorage.totalCount) items)"
     }
     
     /// Starts background exact KVC size resolution and dedupe hashing.
@@ -156,47 +156,66 @@ public final class PhotoManagerCoordinator: ObservableObject {
             }
         }
         
-        // 3. Gentle Background KVC Size Refiner (3 workers, zero daemon thrashing)
+        // 3. Background KVC Size Refiner (3 bounded workers, autoreleasepool, zero thermal rising)
         Task { [weak self] in
             guard let self = self else { return }
-            await self.runGentleSizeRefiner()
+            await self.runKvcSizeResolver()
         }
     }
     
-    private func runGentleSizeRefiner() async {
+    private func runKvcSizeResolver() async {
         let uncachedAssets = (allPhotos + allVideos).filter { sizeRecords[$0.localIdentifier] == nil }
         guard !uncachedAssets.isEmpty else {
             isIndexing = false
             return
         }
         
-        var newRecords: [String: AssetSizeRecord] = [:]
-        newRecords.reserveCapacity(uncachedAssets.count)
+        statusMessage = "Resolving sizes via KVC…"
         
-        var processed = 0
-        for asset in uncachedAssets {
-            if Task.isCancelled { break }
-            let rec = StorageCalculator.resolveExactSize(for: asset)
-            newRecords[asset.localIdentifier] = rec
-            self.sizeRecords[asset.localIdentifier] = rec
-            processed += 1
+        // Split across 3 workers for fast parallel KVC metadata resolution without daemon thrashing
+        let chunkSize = max(50, (uncachedAssets.count + 2) / 3)
+        let chunks: [[PHAsset]] = stride(from: 0, to: uncachedAssets.count, by: chunkSize).map {
+            Array(uncachedAssets[$0..<min($0 + chunkSize, uncachedAssets.count)])
+        }
+        
+        await withTaskGroup(of: [String: AssetSizeRecord].self) { group in
+            for chunk in chunks {
+                group.addTask {
+                    var resolved: [String: AssetSizeRecord] = [:]
+                    resolved.reserveCapacity(chunk.count)
+                    for (idx, asset) in chunk.enumerated() {
+                        if Task.isCancelled { break }
+                        let rec = StorageCalculator.resolveExactSize(for: asset)
+                        resolved[asset.localIdentifier] = rec
+                        if idx % 50 == 0 {
+                            await Task.yield()
+                        }
+                    }
+                    return resolved
+                }
+            }
             
-            if newRecords.count >= 200 {
-                await cache.putSizeBatch(newRecords)
-                newRecords.removeAll(keepingCapacity: true)
-                
-                // Update smart albums and threshold cards with refined numbers
-                self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: self.sizeRecords)
-                self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: self.allPhotos, sizeRecords: self.sizeRecords)
-                self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: self.allVideos, sizeRecords: self.sizeRecords)
+            for await batch in group {
+                await MainActor.run {
+                    for (id, rec) in batch {
+                        self.sizeRecords[id] = rec
+                    }
+                    self.storageOverview = StorageCalculator.computeOverview(
+                        photos: self.allPhotos,
+                        videos: self.allVideos,
+                        sizeRecords: self.sizeRecords
+                    )
+                    self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: self.sizeRecords)
+                    self.videoSmartAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: self.allVideos, sizeRecords: self.sizeRecords)
+                    self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: self.allPhotos, sizeRecords: self.sizeRecords)
+                    self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: self.allVideos, sizeRecords: self.sizeRecords)
+                }
+                await cache.putSizeBatch(batch)
             }
         }
         
-        if !newRecords.isEmpty {
-            await cache.putSizeBatch(newRecords)
-        }
-        
         isIndexing = false
+        statusMessage = "Ready"
     }
     
     // MARK: - Deletion Action
@@ -226,7 +245,7 @@ public final class PhotoManagerCoordinator: ObservableObject {
             self.videoSimilars = cleanGroups(self.videoSimilars, deleted: deletedSet)
             
             // Recalculate smart albums & overview
-            await fetchAssetsAndComputeInstantOverview()
+            await fetchAssetsAndComputeOverview()
             return true
         } catch {
             return false

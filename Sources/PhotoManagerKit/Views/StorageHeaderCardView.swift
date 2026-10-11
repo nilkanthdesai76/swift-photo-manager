@@ -19,15 +19,13 @@ public struct StorageHeaderCardView: View {
                             .fontWeight(.medium)
                             .foregroundColor(.secondary)
                         
-                        if overview.isEstimated {
-                            Text("⚡️ Instant")
-                                .font(.system(size: 10, weight: .bold))
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.green.opacity(0.15))
-                                .foregroundColor(.green)
-                                .cornerRadius(6)
-                        }
+                        Text("KVC")
+                            .font(.system(size: 10, weight: .bold))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.blue.opacity(0.15))
+                            .foregroundColor(.blue)
+                            .cornerRadius(6)
                     }
                     
                     Text(overview.formattedTotalSize)
