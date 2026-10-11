@@ -54,10 +54,12 @@ public struct PlatformImageView: View {
         Image(uiImage: image)
             .resizable()
             .aspectRatio(contentMode: contentMode)
+            .clipped()
         #elseif canImport(AppKit)
         Image(nsImage: image)
             .resizable()
             .aspectRatio(contentMode: contentMode)
+            .clipped()
         #endif
     }
 }

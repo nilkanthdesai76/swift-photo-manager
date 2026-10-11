@@ -88,41 +88,70 @@ public struct GalleryExplorerView: View {
                 newestAssetID: cat.coverAssetID
             )
         } label: {
-            HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12)
-                        .fill(colorFor(cat.colorName).opacity(0.18))
-                        .frame(width: 44, height: 44)
+            VStack(alignment: .leading, spacing: 8) {
+                // 1:1 Album Cover Preview
+                ZStack(alignment: .topTrailing) {
+                    if let coverID = cat.coverAssetID {
+                        AssetThumbnailView(assetID: coverID)
+                            .aspectRatio(1, contentMode: .fit)
+                            .clipped()
+                    } else {
+                        Rectangle()
+                            .fill(
+                                LinearGradient(
+                                    colors: [colorFor(cat.colorName).opacity(0.35), colorFor(cat.colorName).opacity(0.12)],
+                                    startPoint: .topLeading,
+                                    endPoint: .bottomTrailing
+                                )
+                            )
+                            .aspectRatio(1, contentMode: .fit)
+                            .overlay(
+                                Image(systemName: cat.sfSymbol)
+                                    .font(.system(size: 36))
+                                    .foregroundColor(colorFor(cat.colorName))
+                            )
+                    }
                     
+                    // Floating Category SF Symbol Badge
                     Image(systemName: cat.sfSymbol)
-                        .font(.title3)
+                        .font(.system(size: 11, weight: .bold))
                         .foregroundColor(colorFor(cat.colorName))
+                        .padding(6)
+                        .background(.ultraThinMaterial)
+                        .clipShape(Circle())
+                        .shadow(color: Color.black.opacity(0.12), radius: 3, x: 0, y: 1)
+                        .padding(6)
                 }
+                .aspectRatio(1, contentMode: .fit)
+                .cornerRadius(12)
+                .clipped()
                 
-                VStack(alignment: .leading, spacing: 3) {
+                // Full wrap-safe album title & stats
+                VStack(alignment: .leading, spacing: 2) {
                     Text(cat.title)
                         .font(.subheadline)
-                        .fontWeight(.semibold)
+                        .fontWeight(.bold)
                         .foregroundColor(.primary)
-                        .lineLimit(1)
+                        .lineLimit(2)
+                        .multilineTextAlignment(.leading)
+                        .fixedSize(horizontal: false, vertical: true)
                     
-                    HStack(spacing: 4) {
-                        Text("\(cat.count)")
-                            .fontWeight(.bold)
-                        Text("• \(cat.formattedSize)")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
+                    Text("\(cat.count) items • \(cat.formattedSize)")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                        .lineLimit(1)
                 }
-                
-                Spacer()
+                .padding(.horizontal, 4)
+                .padding(.bottom, 4)
             }
-            .padding(12)
+            .padding(8)
             .background(Color.platformSecondaryBackground)
-            .cornerRadius(14)
+            .cornerRadius(16)
+            .clipped()
         }
         .buttonStyle(.plain)
     }
+
     
     // MARK: - 2. User Albums Section
     

@@ -29,7 +29,7 @@ private final class ThumbnailCache {
     }
 }
 
-/// High-performance PhotoKit thumbnail view with in-memory caching and opportunistic loading.
+/// High-performance PhotoKit thumbnail view with in-memory caching and strict 1:1 clipping.
 public struct AssetThumbnailView: View {
     public let assetID: String
     public var targetSize: CGSize
@@ -43,7 +43,7 @@ public struct AssetThumbnailView: View {
     
     public init(
         assetID: String,
-        targetSize: CGSize = CGSize(width: 200, height: 200),
+        targetSize: CGSize = CGSize(width: 250, height: 250),
         contentMode: ContentMode = .fill
     ) {
         self.assetID = assetID
@@ -52,60 +52,65 @@ public struct AssetThumbnailView: View {
     }
     
     public var body: some View {
-        ZStack {
-            if let image = platformImage {
-                PlatformImageView(image: image, contentMode: contentMode)
-            } else {
-                Rectangle()
-                    .fill(Color.gray.opacity(0.2))
-                    .overlay(
-                        ProgressView()
-                            .scaleEffect(0.6)
-                    )
-            }
-            
-            // Live Photo Badge
-            if isLivePhoto {
-                VStack {
-                    HStack {
-                        Image(systemName: "livephoto")
-                            .font(.system(size: 11, weight: .semibold))
-                            .foregroundColor(.white)
-                            .padding(4)
-                            .background(Color.black.opacity(0.55))
-                            .clipShape(Circle())
-                            .padding(4)
-                        Spacer()
+        Color.clear
+            .aspectRatio(1, contentMode: .fit)
+            .overlay(
+                ZStack {
+                    if let image = platformImage {
+                        PlatformImageView(image: image, contentMode: contentMode)
+                    } else {
+                        Rectangle()
+                            .fill(Color.gray.opacity(0.2))
+                            .overlay(
+                                ProgressView()
+                                    .scaleEffect(0.6)
+                            )
                     }
-                    Spacer()
-                }
-            }
-            
-            // Video Duration Badge
-            if isVideo, let duration = durationString {
-                VStack {
-                    Spacer()
-                    HStack {
-                        Spacer()
-                        Text(duration)
-                            .font(.system(size: 10, weight: .bold))
-                            .foregroundColor(.white)
-                            .padding(.horizontal, 5)
-                            .padding(.vertical, 2)
-                            .background(Color.black.opacity(0.65))
-                            .cornerRadius(4)
-                            .padding(4)
+                    
+                    // Live Photo Badge
+                    if isLivePhoto {
+                        VStack {
+                            HStack {
+                                Image(systemName: "livephoto")
+                                    .font(.system(size: 11, weight: .semibold))
+                                    .foregroundColor(.white)
+                                    .padding(4)
+                                    .background(Color.black.opacity(0.55))
+                                    .clipShape(Circle())
+                                    .padding(4)
+                                Spacer()
+                            }
+                            Spacer()
+                        }
+                    }
+                    
+                    // Video Duration Badge
+                    if isVideo, let duration = durationString {
+                        VStack {
+                            Spacer()
+                            HStack {
+                                Spacer()
+                                Text(duration)
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                                    .padding(.horizontal, 5)
+                                    .padding(.vertical, 2)
+                                    .background(Color.black.opacity(0.65))
+                                    .cornerRadius(4)
+                                    .padding(4)
+                            }
+                        }
                     }
                 }
+            )
+            .clipped()
+            .contentShape(Rectangle())
+            .onAppear {
+                loadThumbnail()
             }
-        }
-        .clipped()
-        .onAppear {
-            loadThumbnail()
-        }
-        .onDisappear {
-            cancelRequest()
-        }
+            .onDisappear {
+                cancelRequest()
+            }
     }
     
     private func loadThumbnail() {

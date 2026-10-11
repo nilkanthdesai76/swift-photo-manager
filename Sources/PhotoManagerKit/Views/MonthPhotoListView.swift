@@ -96,7 +96,6 @@ public struct MonthPhotoListView: View {
         let isSelected = selectedIDs.contains(id)
         return ZStack(alignment: .topTrailing) {
             AssetThumbnailView(assetID: id)
-                .aspectRatio(1, contentMode: .fill)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     if isSelectionMode {
@@ -115,6 +114,7 @@ public struct MonthPhotoListView: View {
                     .padding(6)
             }
         }
+        .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 6))
     }
     

@@ -167,7 +167,6 @@ public struct GroupReviewView: View {
         return ZStack(alignment: .topTrailing) {
             // Photo Thumbnail (Tap to open full photo details)
             AssetThumbnailView(assetID: item.wrappedValue.id)
-                .aspectRatio(1, contentMode: .fill)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     selectedDetailAssetID = item.wrappedValue.id
@@ -232,6 +231,7 @@ public struct GroupReviewView: View {
                 .disabled(isBest)
             }
         }
+        .clipped()
         .clipShape(RoundedRectangle(cornerRadius: 12))
         .overlay(
             RoundedRectangle(cornerRadius: 12)

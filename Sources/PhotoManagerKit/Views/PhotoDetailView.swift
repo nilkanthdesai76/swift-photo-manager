@@ -121,6 +121,8 @@ public struct PhotoDetailView: View {
                     .foregroundColor(.gray)
             }
         }
+        .clipped()
+        .clipShape(RoundedRectangle(cornerRadius: 16))
         .padding(.horizontal, 16)
     }
     
