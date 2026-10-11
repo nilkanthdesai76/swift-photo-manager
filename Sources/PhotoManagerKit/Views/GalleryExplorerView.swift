@@ -6,7 +6,7 @@ import Photos
 
 /// Second tab view presenting AI-categorized photo albums, user albums, and collapsible chronological Year-Month timeline.
 public struct GalleryExplorerView: View {
-    @ObservedObject public var coordinator: PhotoManagerCoordinator
+    public var coordinator: PhotoManagerCoordinator
     
     @State private var expandedYears: Set<Int> = []
     @State private var selectedSmartAlbum: SmartAlbumItem?

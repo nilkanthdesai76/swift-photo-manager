@@ -5,35 +5,35 @@ import Photos
 #endif
 
 /// The unified Photo Library Manager dashboard containing storage stats, segments, dedupe progress cards, and smart albums.
+/// Uses targeted fine-grained observation via the Observation framework for fluid 120 FPS interaction.
 @MainActor
 public struct PhotoManagerDashboardView: View {
-    @StateObject private var coordinator: PhotoManagerCoordinator
+    @Bindable public var coordinator: PhotoManagerCoordinator
     
     // Sheet Navigation State
     @State private var activeReviewTitle: String?
     @State private var activeReviewGroups: [DedupeGroup] = []
-    @State private var activeReviewKind: DedupeMatchKind?
     @State private var activeAlbumDetail: SmartAlbumItem?
     
     public init() {
-        self._coordinator = StateObject(wrappedValue: PhotoManagerCoordinator())
+        self.coordinator = PhotoManagerCoordinator()
     }
     
     public init(coordinator: PhotoManagerCoordinator) {
-        self._coordinator = StateObject(wrappedValue: coordinator)
+        self.coordinator = coordinator
     }
     
     public var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 16) {
-                    // 1. Top Storage Card
-                    StorageHeaderCardView(overview: coordinator.storageOverview)
+                    // 1. Top Storage Overview Card (Targeted: observes storageOverview only)
+                    StorageHeaderCardSection(coordinator: coordinator)
                     
                     // 2. Segmented Picker: [Photos | Videos]
                     Picker("Category", selection: $coordinator.selectedSegment) {
-                        Text("Photos (\(coordinator.storageOverview.photosCount + coordinator.storageOverview.livePhotosCount))").tag(0)
-                        Text("Videos (\(coordinator.storageOverview.videosCount))").tag(1)
+                        Text("Photos").tag(0)
+                        Text("Videos").tag(1)
                     }
                     .pickerStyle(.segmented)
                     .padding(.horizontal, 4)
@@ -54,10 +54,7 @@ public struct PhotoManagerDashboardView: View {
             #endif
             .toolbar {
                 ToolbarItem(placement: .primaryAction) {
-                    if coordinator.isIndexing {
-                        ProgressView()
-                            .controlSize(.small)
-                    }
+                    PipelineStatusToolbarItem(coordinator: coordinator)
                 }
             }
             .task {
@@ -99,67 +96,27 @@ public struct PhotoManagerDashboardView: View {
     
     private var photosSegmentContent: some View {
         VStack(spacing: 14) {
-            // Dedupe Section Header
-            sectionHeader(title: "Duplicates & Similar", count: coordinator.photoDuplicates.count + coordinator.photoSimilars.count)
-            
-            // 1. Duplicate Photos Card (Top)
-            DedupeProgressCardView(
-                title: "Duplicate Photos",
-                subtitle: "Exact duplicate photos",
-                sfSymbol: "doc.on.doc.fill",
-                accentColor: .blue,
-                groups: coordinator.photoDuplicates,
-                progress: coordinator.photoDedupeProgress
-            ) {
-                activeReviewTitle = "Duplicate Photos"
-                activeReviewGroups = coordinator.photoDuplicates
-                activeReviewKind = .exactDuplicate
-            }
-            
-            // 2. Similar Photos Card (Top)
-            DedupeProgressCardView(
-                title: "Similar Photos",
-                subtitle: "Burst shots & consecutive captures",
-                sfSymbol: "sparkles.rectangle.stack.fill",
-                accentColor: .purple,
-                groups: coordinator.photoSimilars,
-                progress: coordinator.photoDedupeProgress
-            ) {
-                activeReviewTitle = "Similar Photos"
-                activeReviewGroups = coordinator.photoSimilars
-                activeReviewKind = .similar
-            }
-            
-            // System Smart Albums
-            if !coordinator.photoSmartAlbums.isEmpty {
-                sectionHeader(title: "System Albums", count: coordinator.photoSmartAlbums.count)
-                
-                VStack(spacing: 8) {
-                    ForEach(coordinator.photoSmartAlbums) { album in
-                        SmartAlbumCardView(item: album) {
-                            activeAlbumDetail = album
-                        }
-                    }
+            // Dedupe Cards (Targeted: observes photoDuplicates & photoDedupeProgress only)
+            PhotosSegmentDedupeCards(
+                coordinator: coordinator,
+                onReviewDuplicates: { groups in
+                    activeReviewTitle = "Duplicate Photos"
+                    activeReviewGroups = groups
+                },
+                onReviewSimilars: { groups in
+                    activeReviewTitle = "Similar Photos"
+                    activeReviewGroups = groups
                 }
+            )
+            
+            // System Smart Albums (Targeted: observes photoSmartAlbums only)
+            PhotoSmartAlbumsSection(coordinator: coordinator) { album in
+                activeAlbumDetail = album
             }
             
-            // Filter Cards (Large Photos & Old Photos)
-            if coordinator.largePhotosAlbum != nil || coordinator.oldPhotosAlbum != nil {
-                sectionHeader(title: "Cleanup Suggestions", count: 2)
-                
-                VStack(spacing: 8) {
-                    if let large = coordinator.largePhotosAlbum {
-                        SmartAlbumCardView(item: large) {
-                            activeAlbumDetail = large
-                        }
-                    }
-                    
-                    if let old = coordinator.oldPhotosAlbum {
-                        SmartAlbumCardView(item: old) {
-                            activeAlbumDetail = old
-                        }
-                    }
-                }
+            // Cleanup Suggestions (Targeted: observes largePhotosAlbum & oldPhotosAlbum only)
+            PhotoCleanupSuggestionsSection(coordinator: coordinator) { album in
+                activeAlbumDetail = album
             }
         }
     }
@@ -168,10 +125,134 @@ public struct PhotoManagerDashboardView: View {
     
     private var videosSegmentContent: some View {
         VStack(spacing: 14) {
-            // Dedupe Section Header
+            // Dedupe Cards (Targeted: observes videoDuplicates & videoDedupeProgress only)
+            VideosSegmentDedupeCards(
+                coordinator: coordinator,
+                onReviewDuplicates: { groups in
+                    activeReviewTitle = "Duplicate Videos"
+                    activeReviewGroups = groups
+                },
+                onReviewSimilars: { groups in
+                    activeReviewTitle = "Similar Videos"
+                    activeReviewGroups = groups
+                }
+            )
+            
+            // Video System Groups (Targeted: observes videoSmartAlbums only)
+            VideoSmartAlbumsSection(coordinator: coordinator) { album in
+                activeAlbumDetail = album
+            }
+            
+            // Large Videos (Targeted: observes largeVideosAlbum only)
+            LargeVideosSection(coordinator: coordinator) { album in
+                activeAlbumDetail = album
+            }
+        }
+    }
+}
+
+// MARK: - Targeted Subviews (Fine-Grained Observation)
+
+/// Target 1: Storage header card re-evaluates ONLY when storageOverview changes.
+private struct StorageHeaderCardSection: View {
+    var coordinator: PhotoManagerCoordinator
+    
+    var body: some View {
+        StorageHeaderCardView(overview: coordinator.storageOverview)
+    }
+}
+
+/// Target 2: Photo dedupe cards re-evaluate ONLY when photoDuplicates, photoSimilars, or photoDedupeProgress changes.
+private struct PhotosSegmentDedupeCards: View {
+    var coordinator: PhotoManagerCoordinator
+    let onReviewDuplicates: ([DedupeGroup]) -> Void
+    let onReviewSimilars: ([DedupeGroup]) -> Void
+    
+    var body: some View {
+        VStack(spacing: 14) {
+            sectionHeader(title: "Duplicates & Similar", count: coordinator.photoDuplicates.count + coordinator.photoSimilars.count)
+            
+            // 1. Duplicate Photos Card
+            DedupeProgressCardView(
+                title: "Duplicate Photos",
+                subtitle: "Exact duplicate photos",
+                sfSymbol: "doc.on.doc.fill",
+                accentColor: .blue,
+                groups: coordinator.photoDuplicates,
+                progress: coordinator.photoDedupeProgress
+            ) {
+                onReviewDuplicates(coordinator.photoDuplicates)
+            }
+            
+            // 2. Similar Photos Card
+            DedupeProgressCardView(
+                title: "Similar Photos",
+                subtitle: "Burst shots & consecutive captures",
+                sfSymbol: "sparkles.rectangle.stack.fill",
+                accentColor: .purple,
+                groups: coordinator.photoSimilars,
+                progress: coordinator.photoDedupeProgress
+            ) {
+                onReviewSimilars(coordinator.photoSimilars)
+            }
+        }
+    }
+}
+
+/// Target 3: Photo smart albums re-evaluate ONLY when photoSmartAlbums changes.
+private struct PhotoSmartAlbumsSection: View {
+    var coordinator: PhotoManagerCoordinator
+    let onSelectAlbum: (SmartAlbumItem) -> Void
+    
+    var body: some View {
+        if !coordinator.photoSmartAlbums.isEmpty {
+            VStack(spacing: 8) {
+                sectionHeader(title: "System Albums", count: coordinator.photoSmartAlbums.count)
+                ForEach(coordinator.photoSmartAlbums) { album in
+                    SmartAlbumCardView(item: album) {
+                        onSelectAlbum(album)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Target 4: Cleanup suggestions re-evaluate ONLY when largePhotosAlbum or oldPhotosAlbum changes.
+private struct PhotoCleanupSuggestionsSection: View {
+    var coordinator: PhotoManagerCoordinator
+    let onSelectAlbum: (SmartAlbumItem) -> Void
+    
+    var body: some View {
+        if coordinator.largePhotosAlbum != nil || coordinator.oldPhotosAlbum != nil {
+            VStack(spacing: 8) {
+                sectionHeader(title: "Cleanup Suggestions", count: 2)
+                if let large = coordinator.largePhotosAlbum {
+                    SmartAlbumCardView(item: large) {
+                        onSelectAlbum(large)
+                    }
+                }
+                if let old = coordinator.oldPhotosAlbum {
+                    SmartAlbumCardView(item: old) {
+                        onSelectAlbum(old)
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Target 5: Video dedupe cards re-evaluate ONLY when videoDuplicates, videoSimilars, or videoDedupeProgress changes.
+private struct VideosSegmentDedupeCards: View {
+    var coordinator: PhotoManagerCoordinator
+    let onReviewDuplicates: ([DedupeGroup]) -> Void
+    let onReviewSimilars: ([DedupeGroup]) -> Void
+    
+    var body: some View {
+        VStack(spacing: 14) {
             sectionHeader(title: "Video Deduplication", count: coordinator.videoDuplicates.count + coordinator.videoSimilars.count)
             
-            // 1. Duplicate Videos Card (Top)
+            // 1. Duplicate Videos Card
             DedupeProgressCardView(
                 title: "Duplicate Videos",
                 subtitle: "Exact duplicate recordings",
@@ -180,12 +261,10 @@ public struct PhotoManagerDashboardView: View {
                 groups: coordinator.videoDuplicates,
                 progress: coordinator.videoDedupeProgress
             ) {
-                activeReviewTitle = "Duplicate Videos"
-                activeReviewGroups = coordinator.videoDuplicates
-                activeReviewKind = .exactDuplicate
+                onReviewDuplicates(coordinator.videoDuplicates)
             }
             
-            // 2. Similar Videos Card (Top)
+            // 2. Similar Videos Card
             DedupeProgressCardView(
                 title: "Similar Videos",
                 subtitle: "Similar duration & motion angles",
@@ -194,47 +273,78 @@ public struct PhotoManagerDashboardView: View {
                 groups: coordinator.videoSimilars,
                 progress: coordinator.videoDedupeProgress
             ) {
-                activeReviewTitle = "Similar Videos"
-                activeReviewGroups = coordinator.videoSimilars
-                activeReviewKind = .similar
+                onReviewSimilars(coordinator.videoSimilars)
             }
-            
-            // Video System Groups
-            if !coordinator.videoSmartAlbums.isEmpty {
+        }
+    }
+}
+
+/// Target 6: Video system groups re-evaluate ONLY when videoSmartAlbums changes.
+private struct VideoSmartAlbumsSection: View {
+    var coordinator: PhotoManagerCoordinator
+    let onSelectAlbum: (SmartAlbumItem) -> Void
+    
+    var body: some View {
+        if !coordinator.videoSmartAlbums.isEmpty {
+            VStack(spacing: 8) {
                 sectionHeader(title: "Video Categories", count: coordinator.videoSmartAlbums.count)
-                
-                VStack(spacing: 8) {
-                    ForEach(coordinator.videoSmartAlbums) { album in
-                        SmartAlbumCardView(item: album) {
-                            activeAlbumDetail = album
-                        }
+                ForEach(coordinator.videoSmartAlbums) { album in
+                    SmartAlbumCardView(item: album) {
+                        onSelectAlbum(album)
                     }
                 }
             }
-            
-            // Filter Cards (Large Videos)
-            if let largeVideos = coordinator.largeVideosAlbum {
+        }
+    }
+}
+
+/// Target 7: Large videos re-evaluate ONLY when largeVideosAlbum changes.
+private struct LargeVideosSection: View {
+    var coordinator: PhotoManagerCoordinator
+    let onSelectAlbum: (SmartAlbumItem) -> Void
+    
+    var body: some View {
+        if let largeVideos = coordinator.largeVideosAlbum {
+            VStack(spacing: 8) {
                 sectionHeader(title: "Space Hogs", count: 1)
-                
                 SmartAlbumCardView(item: largeVideos) {
-                    activeAlbumDetail = largeVideos
+                    onSelectAlbum(largeVideos)
                 }
             }
         }
     }
+}
+
+/// Target 8: Toolbar indicator re-evaluates ONLY when isIndexing or currentStep changes.
+private struct PipelineStatusToolbarItem: View {
+    var coordinator: PhotoManagerCoordinator
     
-    private func sectionHeader(title: String, count: Int) -> some View {
-        HStack {
-            Text(title)
-                .font(.footnote)
-                .fontWeight(.bold)
-                .foregroundColor(.secondary)
-                .textCase(.uppercase)
-            Spacer()
+    var body: some View {
+        if coordinator.isIndexing {
+            HStack(spacing: 6) {
+                ProgressView()
+                    .controlSize(.small)
+                Text(coordinator.currentStep.rawValue)
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
         }
-        .padding(.horizontal, 4)
-        .padding(.top, 6)
     }
+}
+
+// MARK: - Helpers
+
+private func sectionHeader(title: String, count: Int) -> some View {
+    HStack {
+        Text(title)
+            .font(.footnote)
+            .fontWeight(.bold)
+            .foregroundColor(.secondary)
+            .textCase(.uppercase)
+        Spacer()
+    }
+    .padding(.horizontal, 4)
+    .padding(.top, 6)
 }
 
 private struct DedupeReviewSheetItem: Identifiable {

@@ -1,5 +1,5 @@
 import Foundation
-import Combine
+import Observation
 
 #if canImport(Photos)
 import Photos
@@ -21,50 +21,66 @@ public struct LibrarySnapshot: Sendable {
 }
 #endif
 
+/// Sequential pipeline stage enum for targeted granular UI status updates.
+public enum PipelineStep: String, Sendable, Equatable {
+    case idle = "Idle"
+    case fetchingSizes = "Calculating file sizes…"
+    case photoDedupe = "Scanning photo duplicates…"
+    case videoDedupe = "Scanning video duplicates…"
+    case aiSorting = "Sorting photos with AI…"
+    case completed = "Ready"
+}
+
 /// Main orchestrator managing the library lifecycle, storage calculations, smart albums, and dedupe progress.
-/// UI state is published on `@MainActor`; ALL heavy PhotoKit and Vision workloads run in cooperative background tasks.
+/// Uses the Swift `@Observable` macro for fine-grained, targeted UI invalidation without halting user interaction.
+/// Pipelines execute strictly sequentially one-by-one: Sizes -> Photo Dedupe -> Video Dedupe -> AI Sorting.
+@Observable
 @MainActor
-public final class PhotoManagerCoordinator: ObservableObject {
+public final class PhotoManagerCoordinator {
     
-    // MARK: - Published State
+    // MARK: - Observable State (Granular per-property observation)
     
-    @Published public var storageOverview: LibraryStorageOverview = .empty
-    @Published public var selectedSegment: Int = 0 // 0 = Photos, 1 = Videos
+    public var storageOverview: LibraryStorageOverview = .empty
+    public var selectedSegment: Int = 0 // 0 = Photos, 1 = Videos
     
     // Photos Segment
-    @Published public var photoDuplicates: [DedupeGroup] = []
-    @Published public var photoSimilars: [DedupeGroup] = []
-    @Published public var photoDedupeProgress: ScanProgress = .idle
-    @Published public var photoSmartAlbums: [SmartAlbumItem] = []
-    @Published public var largePhotosAlbum: SmartAlbumItem?
-    @Published public var oldPhotosAlbum: SmartAlbumItem?
+    public var photoDuplicates: [DedupeGroup] = []
+    public var photoSimilars: [DedupeGroup] = []
+    public var photoDedupeProgress: ScanProgress = .idle
+    public var photoSmartAlbums: [SmartAlbumItem] = []
+    public var largePhotosAlbum: SmartAlbumItem?
+    public var oldPhotosAlbum: SmartAlbumItem?
     
     // Videos Segment
-    @Published public var videoDuplicates: [DedupeGroup] = []
-    @Published public var videoSimilars: [DedupeGroup] = []
-    @Published public var videoDedupeProgress: ScanProgress = .idle
-    @Published public var videoSmartAlbums: [SmartAlbumItem] = []
-    @Published public var largeVideosAlbum: SmartAlbumItem?
+    public var videoDuplicates: [DedupeGroup] = []
+    public var videoSimilars: [DedupeGroup] = []
+    public var videoDedupeProgress: ScanProgress = .idle
+    public var videoSmartAlbums: [SmartAlbumItem] = []
+    public var largeVideosAlbum: SmartAlbumItem?
     
     // AI & Timeline
-    @Published public var yearSections: [YearSection] = []
-    @Published public var aiCategories: [AICategoryItem] = []
-    @Published public var userAlbums: [UserAlbumItem] = []
+    public var yearSections: [YearSection] = []
+    public var aiCategories: [AICategoryItem] = []
+    public var userAlbums: [UserAlbumItem] = []
     
-    @Published public var isIndexing: Bool = false
-    @Published public var statusMessage: String = "Ready"
+    public var isIndexing: Bool = false
+    public var currentStep: PipelineStep = .idle
+    public var statusMessage: String = "Ready"
     
-    @Published public var sizeRecords: [String: AssetSizeRecord] = [:]
+    public var sizeRecords: [String: AssetSizeRecord] = [:]
     
+    @ObservationIgnored
     private let cache: PhotoManagerCache
+    @ObservationIgnored
     private var allPhotos: [PHAsset] = []
+    @ObservationIgnored
     private var allVideos: [PHAsset] = []
+    @ObservationIgnored
+    private var hasStarted = false
     
     public init(cache: PhotoManagerCache = .shared) {
         self.cache = cache
     }
-    
-    private var hasStarted = false
     
     // MARK: - Lifecycle
     
@@ -75,7 +91,7 @@ public final class PhotoManagerCoordinator: ObservableObject {
         statusMessage = "Restoring library snapshot…"
         await cache.bootstrap()
         
-        // 1. Restore cached dedupe clusters instantly
+        // 1. Restore cached dedupe clusters & sizes instantly
         let cachedGroups = await cache.getDedupeResults()
         self.photoDuplicates = cachedGroups.photoDuplicates
         self.photoSimilars = cachedGroups.photoSimilars
@@ -104,8 +120,8 @@ public final class PhotoManagerCoordinator: ObservableObject {
         // 3. Publish snapshot instantly (takes < 1ms on main thread)
         self.applySnapshot(snapshot)
         
-        // 4. Launch non-blocking background pipelines
-        self.startBackgroundPipelines(cachedAICats: cachedAICats)
+        // 4. Launch sequential one-by-one background pipelines
+        self.startSequentialPipelines(cachedAICats: cachedAICats)
         #endif
     }
     
@@ -187,20 +203,40 @@ public final class PhotoManagerCoordinator: ObservableObject {
         )
     }
     
-    /// Starts background exact KVC size resolution, dedupe hashing, and AI scene classification.
-    private func startBackgroundPipelines(cachedAICats: [String: String]) {
+    /// Starts background execution strictly one-by-one in sequence:
+    /// 1. Exact KVC size resolution -> 2. Photo deduplication -> 3. Video deduplication -> 4. AI sorting
+    private func startSequentialPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
         let videos = self.allVideos
-        let sizes = self.sizeRecords
         let cacheRef = self.cache
         
-        // 1. Photo Dedupe Pipeline (runs in background detached task)
         Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
-            let results = await PhotoDedupeEngine.scanPhotoDedupe(
+            
+            // ==========================================
+            // STEP 1: SIZE FETCH (Exact KVC sizes)
+            // ==========================================
+            await MainActor.run {
+                self.currentStep = .fetchingSizes
+                self.isIndexing = true
+                self.statusMessage = "Resolving file sizes via KVC…"
+            }
+            await self.runKvcSizeResolver()
+            
+            if Task.isCancelled { return }
+            
+            // ==========================================
+            // STEP 2: SIMILAR & DUPLICATE FOR PHOTOS
+            // ==========================================
+            await MainActor.run {
+                self.currentStep = .photoDedupe
+                self.statusMessage = "Scanning for similar & duplicate photos…"
+            }
+            let currentSizes = await MainActor.run { self.sizeRecords }
+            let photoResults = await PhotoDedupeEngine.scanPhotoDedupe(
                 assets: photos,
                 cache: cacheRef,
-                sizeRecords: sizes,
+                sizeRecords: currentSizes,
                 progressHandler: { [weak self] p in
                     Task { @MainActor in
                         self?.photoDedupeProgress = p
@@ -208,19 +244,24 @@ public final class PhotoManagerCoordinator: ObservableObject {
                 }
             )
             await MainActor.run {
-                self.photoDuplicates = results.duplicates
-                self.photoSimilars = results.similars
+                self.photoDuplicates = photoResults.duplicates
+                self.photoSimilars = photoResults.similars
                 self.photoDedupeProgress = .done
             }
-        }
-        
-        // 2. Video Dedupe Pipeline (runs in background detached task)
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self = self else { return }
-            let results = await VideoDedupeEngine.scanVideoDedupe(
+            
+            if Task.isCancelled { return }
+            
+            // ==========================================
+            // STEP 3: SIMILAR & DUPLICATE FOR VIDEOS
+            // ==========================================
+            await MainActor.run {
+                self.currentStep = .videoDedupe
+                self.statusMessage = "Scanning for duplicate videos…"
+            }
+            let videoResults = await VideoDedupeEngine.scanVideoDedupe(
                 videos: videos,
                 cache: cacheRef,
-                sizeRecords: sizes,
+                sizeRecords: currentSizes,
                 progressHandler: { [weak self] p in
                     Task { @MainActor in
                         self?.videoDedupeProgress = p
@@ -228,20 +269,34 @@ public final class PhotoManagerCoordinator: ObservableObject {
                 }
             )
             await MainActor.run {
-                self.videoDuplicates = results.duplicates
-                self.videoSimilars = results.similars
+                self.videoDuplicates = videoResults.duplicates
+                self.videoSimilars = videoResults.similars
                 self.videoDedupeProgress = .done
             }
-        }
-        
-        // 3. Background KVC Size Refiner (runs in background detached task)
-        Task.detached(priority: .utility) { [weak self] in
-            await self?.runKvcSizeResolver()
-        }
-        
-        // 4. Background AI Scene & Object Classifier (runs in background detached task)
-        Task.detached(priority: .utility) { [weak self] in
-            await self?.runAICategoryScanner(photos: photos, initialCache: cachedAICats, cache: cacheRef)
+            
+            if Task.isCancelled { return }
+            
+            // ==========================================
+            // STEP 4: AI SORTING
+            // ==========================================
+            await MainActor.run {
+                self.currentStep = .aiSorting
+                self.statusMessage = "Categorizing photos with AI Vision…"
+            }
+            await self.runAICategoryScanner(
+                photos: photos,
+                initialCache: cachedAICats,
+                cache: cacheRef
+            )
+            
+            // ==========================================
+            // PIPELINE COMPLETE
+            // ==========================================
+            await MainActor.run {
+                self.currentStep = .completed
+                self.isIndexing = false
+                self.statusMessage = "Ready"
+            }
         }
     }
     
@@ -251,11 +306,8 @@ public final class PhotoManagerCoordinator: ObservableObject {
         }
         let uncachedAssets = (photos + videos).filter { currentSizes[$0.localIdentifier] == nil }
         guard !uncachedAssets.isEmpty else {
-            await MainActor.run { self.isIndexing = false }
             return
         }
-        
-        await MainActor.run { self.statusMessage = "Resolving sizes via KVC…" }
         
         let chunkSize = 50
         let chunks: [[PHAsset]] = stride(from: 0, to: uncachedAssets.count, by: chunkSize).map {
@@ -289,7 +341,7 @@ public final class PhotoManagerCoordinator: ObservableObject {
             await Task.yield()
         }
         
-        // Final background refresh once all sizes are resolved
+        // Final refresh of size-dependent collections once all sizes are resolved
         let (finalPhotos, finalVideos, finalSizes) = await MainActor.run {
             (self.allPhotos, self.allVideos, self.sizeRecords)
         }
@@ -306,8 +358,6 @@ public final class PhotoManagerCoordinator: ObservableObject {
             self.largePhotosAlbum = lPhotos
             self.largeVideosAlbum = lVideos
             self.yearSections = timeline
-            self.isIndexing = false
-            self.statusMessage = "Ready"
         }
     }
     
