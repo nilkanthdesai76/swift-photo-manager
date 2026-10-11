@@ -56,6 +56,7 @@ public actor PhotoManagerCache {
     private var photoSimilars: [DedupeGroup] = []
     private var videoDuplicates: [DedupeGroup] = []
     private var videoSimilars: [DedupeGroup] = []
+    private var aiCategories: [String: String] = [:]
     
     private var isDirty = false
     private var didBootstrap = false
@@ -69,6 +70,7 @@ public actor PhotoManagerCache {
         var photoSimilars: [DedupeGroup]
         var videoDuplicates: [DedupeGroup]
         var videoSimilars: [DedupeGroup]
+        var aiCategories: [String: String]?
     }
     
     public init() {
@@ -93,6 +95,7 @@ public actor PhotoManagerCache {
             self.photoSimilars = env.photoSimilars
             self.videoDuplicates = env.videoDuplicates
             self.videoSimilars = env.videoSimilars
+            self.aiCategories = env.aiCategories ?? [:]
         }
     }
     
@@ -181,6 +184,25 @@ public actor PhotoManagerCache {
         scheduleDebouncedSave()
     }
     
+    // MARK: - AI Categories
+    
+    public func getAICategory(for id: String) -> String? {
+        aiCategories[id]
+    }
+    
+    public func setAICategories(_ map: [String: String]) {
+        guard !map.isEmpty else { return }
+        for (id, cat) in map {
+            aiCategories[id] = cat
+        }
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func getAllAICategories() -> [String: String] {
+        aiCategories
+    }
+    
     // MARK: - Persistence
     
     public func flush() async {
@@ -194,7 +216,8 @@ public actor PhotoManagerCache {
             photoDuplicates: photoDuplicates,
             photoSimilars: photoSimilars,
             videoDuplicates: videoDuplicates,
-            videoSimilars: videoSimilars
+            videoSimilars: videoSimilars,
+            aiCategories: aiCategories
         )
         let url = fileURL
         
@@ -214,6 +237,7 @@ public actor PhotoManagerCache {
         photoSimilars.removeAll()
         videoDuplicates.removeAll()
         videoSimilars.removeAll()
+        aiCategories.removeAll()
         isDirty = false
         try? FileManager.default.removeItem(at: fileURL)
     }

@@ -40,9 +40,13 @@ public struct GalleryExplorerView: View {
             .background(Color.platformGroupedBackground)
             .navigationTitle("AI & Timeline")
             .sheet(item: $selectedSmartAlbum) { album in
-                AlbumDetailListView(item: album) { ids in
-                    await coordinator.deleteAssets(withIDs: ids)
-                }
+                AlbumDetailListView(
+                    item: album,
+                    sizeRecords: coordinator.sizeRecords,
+                    onDelete: { ids in
+                        await coordinator.deleteAssets(withIDs: ids)
+                    }
+                )
             }
             .onAppear {
                 // Expand most recent years by default
@@ -275,7 +279,10 @@ public struct GalleryExplorerView: View {
                 VStack(spacing: 0) {
                     ForEach(yearSection.months) { month in
                         NavigationLink {
-                            MonthPhotoListView(month: month) { ids in
+                            MonthPhotoListView(
+                                month: month,
+                                sizeRecords: coordinator.sizeRecords
+                            ) { ids in
                                 await coordinator.deleteAssets(withIDs: ids)
                             }
                         } label: {

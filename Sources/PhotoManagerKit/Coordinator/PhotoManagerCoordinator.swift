@@ -37,10 +37,11 @@ public final class PhotoManagerCoordinator: ObservableObject {
     @Published public var isIndexing: Bool = false
     @Published public var statusMessage: String = "Ready"
     
+    @Published public var sizeRecords: [String: AssetSizeRecord] = [:]
+    
     private let cache: PhotoManagerCache
     private var allPhotos: [PHAsset] = []
     private var allVideos: [PHAsset] = []
-    private var sizeRecords: [String: AssetSizeRecord] = [:]
     
     public init(cache: PhotoManagerCache = .shared) {
         self.cache = cache
@@ -120,7 +121,18 @@ public final class PhotoManagerCoordinator: ObservableObject {
         
         // AI & Timeline
         self.yearSections = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
-        self.aiCategories = TimelineAndAIScanner.scanAICategories(photos: photos, sizeRecords: sizeRecords)
+        let cachedAICats = await cache.getAllAICategories()
+        self.aiCategories = TimelineAndAIScanner.scanAICategories(
+            photos: photos,
+            sizeRecords: sizeRecords,
+            cachedCategories: cachedAICats,
+            onNewClassifications: { [weak self] newMap in
+                guard let self = self else { return }
+                Task {
+                    await self.cache.setAICategories(newMap)
+                }
+            }
+        )
         self.userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: sizeRecords)
         
         statusMessage = "Storage calculated (\(kvcStorage.totalCount) items)"

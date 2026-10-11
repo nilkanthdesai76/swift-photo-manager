@@ -85,7 +85,9 @@ public enum TimelineAndAIScanner {
     
     public static func scanAICategories(
         photos: [PHAsset],
-        sizeRecords: [String: AssetSizeRecord] = [:]
+        sizeRecords: [String: AssetSizeRecord] = [:],
+        cachedCategories: [String: String] = [:],
+        onNewClassifications: (([String: String]) -> Void)? = nil
     ) -> [AICategoryItem] {
         var natureIDs: [String] = []
         var peopleIDs: [String] = []
@@ -96,32 +98,41 @@ public enum TimelineAndAIScanner {
         var animalIDs: [String] = []
         var cityIDs: [String] = []
         
-        for (index, asset) in photos.enumerated() {
+        var newClassifications: [String: String] = [:]
+        
+        for asset in photos {
             let id = asset.localIdentifier
-            let isScreenshot = asset.mediaSubtypes.contains(.photoScreenshot)
-            let isPortrait = asset.mediaSubtypes.contains(.photoDepthEffect)
-            let isPanorama = asset.mediaSubtypes.contains(.photoPanorama)
-            let isHDR = asset.mediaSubtypes.contains(.photoHDR)
             
-            if isScreenshot {
-                docIDs.append(id)
-            } else if isPortrait {
-                peopleIDs.append(id)
-            } else if isPanorama {
-                natureIDs.append(id)
+            // 1. Check cache first for instant retrieval
+            let category: String?
+            if let cached = cachedCategories[id] {
+                category = cached
             } else {
-                // Heuristic metadata/scene categorization
-                let bucket = (abs(id.hashValue) + index) % 7
-                switch bucket {
-                case 0: natureIDs.append(id)
-                case 1: peopleIDs.append(id)
-                case 2: foodIDs.append(id)
-                case 3: vehicleIDs.append(id)
-                case 4: animalIDs.append(id)
-                case 5: indoorIDs.append(id)
-                default: cityIDs.append(id)
+                // 2. Classify with real Vision framework
+                let detected = AIPhotoClassifier.classify(asset: asset)
+                if let detected = detected {
+                    newClassifications[id] = detected
                 }
+                category = detected
             }
+            
+            guard let cat = category else { continue }
+            
+            switch cat {
+            case "ai_nature": natureIDs.append(id)
+            case "ai_people": peopleIDs.append(id)
+            case "ai_food": foodIDs.append(id)
+            case "ai_animals": animalIDs.append(id)
+            case "ai_indoor": indoorIDs.append(id)
+            case "ai_vehicles": vehicleIDs.append(id)
+            case "ai_city": cityIDs.append(id)
+            case "ai_docs": docIDs.append(id)
+            default: break
+            }
+        }
+        
+        if !newClassifications.isEmpty {
+            onNewClassifications?(newClassifications)
         }
         
         func makeCategory(

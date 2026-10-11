@@ -86,6 +86,7 @@ public struct PhotoManagerDashboardView: View {
             .sheet(item: $activeAlbumDetail) { album in
                 AlbumDetailListView(
                     item: album,
+                    sizeRecords: coordinator.sizeRecords,
                     onDelete: { ids in
                         await coordinator.deleteAssets(withIDs: ids)
                     }

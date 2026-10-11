@@ -95,4 +95,91 @@ final class PhotoManagerKitTests: XCTestCase {
         let cleared = await cache.getSize(for: "TEST_ASSET_1")
         XCTAssertNil(cleared)
     }
+    
+    // MARK: - 6. AI Classifier Taxonomy Verification Tests
+    
+    func testAIClassifierTaxonomies() {
+        // Verify clothing/shirt is NEVER categorized as a vehicle
+        XCTAssertTrue(AIPhotoClassifier.indoorKeywords.contains("clothing"))
+        XCTAssertTrue(AIPhotoClassifier.indoorKeywords.contains("iron_clothing"))
+        XCTAssertFalse(AIPhotoClassifier.vehicleKeywords.contains("clothing"))
+        XCTAssertFalse(AIPhotoClassifier.vehicleKeywords.contains("shirt"))
+        XCTAssertFalse(AIPhotoClassifier.vehicleKeywords.contains("apparel"))
+        
+        // Verify vehicles contains actual vehicles
+        XCTAssertTrue(AIPhotoClassifier.vehicleKeywords.contains("car"))
+        XCTAssertTrue(AIPhotoClassifier.vehicleKeywords.contains("truck"))
+        XCTAssertTrue(AIPhotoClassifier.vehicleKeywords.contains("motorcycle"))
+        
+        // Verify animals
+        XCTAssertTrue(AIPhotoClassifier.animalKeywords.contains("dog"))
+        XCTAssertTrue(AIPhotoClassifier.animalKeywords.contains("cat"))
+        
+        // Verify food
+        XCTAssertTrue(AIPhotoClassifier.foodKeywords.contains("food"))
+        XCTAssertTrue(AIPhotoClassifier.foodKeywords.contains("pizza"))
+    }
+    
+    // MARK: - 7. Sort & Time Filter Logic Tests
+    
+    func testSortAndFilterLogic() {
+        let now = Date()
+        let cal = Calendar.current
+        
+        let twoDaysAgo = cal.date(byAdding: .day, value: -2, to: now)!
+        let twentyDaysAgo = cal.date(byAdding: .day, value: -20, to: now)!
+        let twoMonthsAgo = cal.date(byAdding: .day, value: -60, to: now)!
+        
+        // Filter .all
+        XCTAssertTrue(AssetTimeFilter.all.matches(date: twoDaysAgo))
+        XCTAssertTrue(AssetTimeFilter.all.matches(date: nil))
+        
+        // Filter .last7Days
+        XCTAssertTrue(AssetTimeFilter.last7Days.matches(date: twoDaysAgo))
+        XCTAssertFalse(AssetTimeFilter.last7Days.matches(date: twentyDaysAgo))
+        
+        // Filter .last30Days
+        XCTAssertTrue(AssetTimeFilter.last30Days.matches(date: twoDaysAgo))
+        XCTAssertTrue(AssetTimeFilter.last30Days.matches(date: twentyDaysAgo))
+        XCTAssertFalse(AssetTimeFilter.last30Days.matches(date: twoMonthsAgo))
+        
+        // Filter .thisYear
+        let currentYear = cal.component(.year, from: now)
+        let midThisYear = cal.date(from: DateComponents(year: currentYear, month: 6, day: 15))!
+        let midLastYear = cal.date(from: DateComponents(year: currentYear - 1, month: 6, day: 15))!
+        let threeYearsAgo = cal.date(from: DateComponents(year: currentYear - 3, month: 6, day: 15))!
+        
+        XCTAssertTrue(AssetTimeFilter.thisYear.matches(date: midThisYear))
+        XCTAssertFalse(AssetTimeFilter.thisYear.matches(date: midLastYear))
+        
+        // Filter .lastYear
+        XCTAssertTrue(AssetTimeFilter.lastYear.matches(date: midLastYear))
+        XCTAssertFalse(AssetTimeFilter.lastYear.matches(date: midThisYear))
+        XCTAssertFalse(AssetTimeFilter.lastYear.matches(date: threeYearsAgo))
+    }
+    
+    // MARK: - 8. Persistent AI Categories Cache Tests
+    
+    func testPhotoManagerCacheAICategories() async {
+        let cache = PhotoManagerCache()
+        await cache.bootstrap()
+        
+        await cache.setAICategories([
+            "PHOTO_SHIRT": "ai_indoor",
+            "PHOTO_CAR": "ai_vehicles",
+            "PHOTO_CAT": "ai_animals"
+        ])
+        
+        let cat1 = await cache.getAICategory(for: "PHOTO_SHIRT")
+        let cat2 = await cache.getAICategory(for: "PHOTO_CAR")
+        let cat3 = await cache.getAICategory(for: "PHOTO_CAT")
+        
+        XCTAssertEqual(cat1, "ai_indoor")
+        XCTAssertEqual(cat2, "ai_vehicles")
+        XCTAssertEqual(cat3, "ai_animals")
+        
+        await cache.clear()
+        let clearedCat = await cache.getAICategory(for: "PHOTO_SHIRT")
+        XCTAssertNil(clearedCat)
+    }
 }

@@ -7,6 +7,7 @@ import Photos
 /// Grid view of photos taken within a specific calendar month.
 public struct MonthPhotoListView: View {
     public let month: MonthGroup
+    public let sizeRecords: [String: AssetSizeRecord]
     public let onDelete: ([String]) async -> Bool
     @Environment(\.dismiss) private var dismiss
     
@@ -16,12 +17,44 @@ public struct MonthPhotoListView: View {
     @State private var showDeleteConfirmation = false
     @State private var isDeleting = false
     
+    // Sort State
+    @State private var selectedSort: AssetSortOrder = .latest
+    @State private var assetCreationDates: [String: Date] = [:]
+    
     public init(
         month: MonthGroup,
+        sizeRecords: [String: AssetSizeRecord] = [:],
         onDelete: @escaping ([String]) async -> Bool
     ) {
         self.month = month
+        self.sizeRecords = sizeRecords
         self.onDelete = onDelete
+    }
+    
+    private var displayedAssetIDs: [String] {
+        month.assetIDs.sorted { id1, id2 in
+            switch selectedSort {
+            case .latest:
+                let d1 = assetCreationDates[id1] ?? Date.distantPast
+                let d2 = assetCreationDates[id2] ?? Date.distantPast
+                if d1 != d2 { return d1 > d2 }
+                return id1 < id2
+                
+            case .oldest:
+                let d1 = assetCreationDates[id1] ?? Date.distantFuture
+                let d2 = assetCreationDates[id2] ?? Date.distantFuture
+                if d1 != d2 { return d1 < d2 }
+                return id1 < id2
+                
+            case .largest:
+                let b1 = sizeRecords[id1]?.totalBytes ?? 0
+                let b2 = sizeRecords[id2]?.totalBytes ?? 0
+                if b1 != b2 { return b1 > b2 }
+                let d1 = assetCreationDates[id1] ?? Date.distantPast
+                let d2 = assetCreationDates[id2] ?? Date.distantPast
+                return d1 > d2
+            }
+        }
     }
     
     private let columns = [
@@ -44,7 +77,7 @@ public struct MonthPhotoListView: View {
             // Photo Grid
             ScrollView {
                 LazyVGrid(columns: columns, spacing: 4) {
-                    ForEach(month.assetIDs, id: \.self) { assetID in
+                    ForEach(displayedAssetIDs, id: \.self) { assetID in
                         monthAssetCell(assetID)
                     }
                 }
@@ -62,11 +95,38 @@ public struct MonthPhotoListView: View {
         #endif
         .toolbar {
             ToolbarItem(placement: .primaryAction) {
-                Button(isSelectionMode ? "Cancel" : "Select") {
-                    isSelectionMode.toggle()
-                    if !isSelectionMode { selectedIDs.removeAll() }
+                HStack(spacing: 14) {
+                    // Sort Menu
+                    Menu {
+                        Section("Sort By") {
+                            ForEach(AssetSortOrder.allCases) { sort in
+                                Button {
+                                    selectedSort = sort
+                                } label: {
+                                    if selectedSort == sort {
+                                        Label(sort.rawValue, systemImage: "checkmark")
+                                    } else {
+                                        Text(sort.rawValue)
+                                    }
+                                }
+                            }
+                        }
+                    } label: {
+                        Image(systemName: "arrow.up.arrow.down.circle")
+                            .font(.title3)
+                    }
+                    
+                    if !month.assetIDs.isEmpty {
+                        Button(isSelectionMode ? "Cancel" : "Select") {
+                            isSelectionMode.toggle()
+                            if !isSelectionMode { selectedIDs.removeAll() }
+                        }
+                    }
                 }
             }
+        }
+        .onAppear {
+            loadAssetDates()
         }
         .confirmationDialog(
             "Delete \(selectedIDs.count) items?",
@@ -160,5 +220,19 @@ public struct MonthPhotoListView: View {
                 }
             }
         }
+    }
+    
+    private func loadAssetDates() {
+        #if canImport(Photos)
+        guard !month.assetIDs.isEmpty else { return }
+        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: month.assetIDs, options: nil)
+        var dates: [String: Date] = [:]
+        fetch.enumerateObjects { asset, _, _ in
+            if let d = asset.creationDate {
+                dates[asset.localIdentifier] = d
+            }
+        }
+        self.assetCreationDates = dates
+        #endif
     }
 }
