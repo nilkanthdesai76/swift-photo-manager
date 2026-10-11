@@ -14,6 +14,7 @@ public struct AlbumDetailListView: View {
     @State private var isSelectionMode = false
     @State private var showDeleteConfirmation = false
     @State private var isDeleting = false
+    @State private var selectedDetailAssetID: String?
     
     public init(
         item: SmartAlbumItem,
@@ -24,7 +25,7 @@ public struct AlbumDetailListView: View {
     }
     
     private let columns = [
-        GridItem(.adaptive(minimum: 100), spacing: 4)
+        GridItem(.adaptive(minimum: 105), spacing: 4)
     ]
     
     public var body: some View {
@@ -82,24 +83,33 @@ public struct AlbumDetailListView: View {
                 }
                 Button("Cancel", role: .cancel) {}
             }
+            .sheet(item: Binding(
+                get: { selectedDetailAssetID.map { IdentifiableString(id: $0) } },
+                set: { selectedDetailAssetID = $0?.id }
+            )) { wrapper in
+                PhotoDetailView(assetID: wrapper.id, onDelete: { singleID in
+                    let success = await onDelete([singleID])
+                    if success {
+                        dismiss()
+                    }
+                    return success
+                })
+            }
         }
     }
     
     private func assetCell(_ id: String) -> some View {
         let isSelected = selectedIDs.contains(id)
         return ZStack(alignment: .topTrailing) {
-            RoundedRectangle(cornerRadius: 8)
-                .fill(Color.gray.opacity(0.18))
+            AssetThumbnailView(assetID: id)
                 .aspectRatio(1, contentMode: .fill)
-                .overlay(
-                    Image(systemName: item.sfSymbol)
-                        .font(.title2)
-                        .foregroundColor(.secondary.opacity(0.5))
-                )
+                .contentShape(Rectangle())
                 .onTapGesture {
                     if isSelectionMode {
                         if isSelected { selectedIDs.remove(id) }
                         else { selectedIDs.insert(id) }
+                    } else {
+                        selectedDetailAssetID = id
                     }
                 }
             
@@ -111,7 +121,7 @@ public struct AlbumDetailListView: View {
                     .padding(6)
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
     }
     
     private var bottomDeleteBar: some View {
@@ -159,4 +169,10 @@ public struct AlbumDetailListView: View {
             }
         }
     }
+}
+
+/// Helper for sheet presentation
+public struct IdentifiableString: Identifiable {
+    public let id: String
+    public init(id: String) { self.id = id }
 }

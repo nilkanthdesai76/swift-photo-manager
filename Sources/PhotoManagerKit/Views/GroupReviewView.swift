@@ -4,7 +4,7 @@ import SwiftUI
 import Photos
 #endif
 
-/// Group-by-group duplicate & similarity review sheet with "Keep Best" selector and safe PhotoKit deletion.
+/// Grid-based duplicate & similarity review sheet with "Keep Best" selector and safe PhotoKit deletion.
 public struct GroupReviewView: View {
     public let title: String
     @Binding public var groups: [DedupeGroup]
@@ -13,6 +13,7 @@ public struct GroupReviewView: View {
     
     @State private var isDeleting = false
     @State private var showDeleteConfirmation = false
+    @State private var selectedDetailAssetID: String?
     
     public init(
         title: String,
@@ -32,6 +33,11 @@ public struct GroupReviewView: View {
         groups.reduce(0) { $0 + $1.items.filter(\.isSelectedForDeletion).count }
     }
     
+    private let gridColumns = [
+        GridItem(.flexible(), spacing: 8),
+        GridItem(.flexible(), spacing: 8)
+    ]
+    
     public var body: some View {
         NavigationStack {
             VStack(spacing: 0) {
@@ -49,9 +55,9 @@ public struct GroupReviewView: View {
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
                 } else {
                     ScrollView {
-                        LazyVStack(spacing: 16) {
+                        LazyVStack(spacing: 20) {
                             ForEach($groups) { $group in
-                                groupSection($group)
+                                groupGridCard($group)
                             }
                         }
                         .padding(16)
@@ -92,99 +98,145 @@ public struct GroupReviewView: View {
             } message: {
                 Text("Selected items will be moved to Recently Deleted in your Photos library.")
             }
+            .sheet(item: Binding(
+                get: { selectedDetailAssetID.map { IdentifiableString(id: $0) } },
+                set: { selectedDetailAssetID = $0?.id }
+            )) { wrapper in
+                PhotoDetailView(assetID: wrapper.id, onDelete: { singleID in
+                    let success = await onDelete([singleID])
+                    if success {
+                        dismiss()
+                    }
+                    return success
+                })
+            }
         }
     }
     
-    private func groupSection(_ group: Binding<DedupeGroup>) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+    // MARK: - Group Card with Photo Grid
+    
+    private func groupGridCard(_ group: Binding<DedupeGroup>) -> some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Group Header
             HStack {
-                Text("\(group.items.count) Items")
-                    .font(.caption)
-                    .fontWeight(.bold)
-                    .foregroundColor(.secondary)
+                VStack(alignment: .leading, spacing: 2) {
+                    Text("\(group.items.count) Similar Items")
+                        .font(.subheadline)
+                        .fontWeight(.bold)
+                    
+                    Text("Reclaim \(ByteFormatter.format(bytes: group.wrappedValue.reclaimableBytes))")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
                 
                 Spacer()
                 
-                Text("Reclaim \(ByteFormatter.format(bytes: group.wrappedValue.reclaimableBytes))")
-                    .font(.caption2)
-                    .fontWeight(.semibold)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color.blue.opacity(0.12))
-                    .foregroundColor(.blue)
-                    .cornerRadius(6)
+                Button {
+                    let best = group.wrappedValue.bestAssetID
+                    for i in 0..<group.wrappedValue.items.count {
+                        group.wrappedValue.items[i].isSelectedForDeletion = (group.wrappedValue.items[i].id != best)
+                    }
+                } label: {
+                    Text("Select Duplicates")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 4)
+                        .background(Color.blue.opacity(0.12))
+                        .foregroundColor(.blue)
+                        .cornerRadius(8)
+                }
             }
             
-            // Asset Items
-            ForEach(group.items) { $item in
-                let isBest = item.id == group.wrappedValue.bestAssetID
-                HStack(spacing: 12) {
-                    // Checkbox
-                    Button {
-                        if !isBest {
-                            item.isSelectedForDeletion.toggle()
-                        }
-                    } label: {
-                        Image(systemName: item.isSelectedForDeletion ? "checkmark.circle.fill" : "circle")
-                            .font(.title3)
-                            .foregroundColor(item.isSelectedForDeletion ? .red : .secondary)
-                    }
-                    .disabled(isBest)
-                    
-                    // Asset Thumbnail / Icon
-                    ZStack {
-                        RoundedRectangle(cornerRadius: 8)
-                            .fill(Color.gray.opacity(0.2))
-                            .frame(width: 50, height: 50)
-                        
-                        Image(systemName: item.isVideo ? "video" : (item.isLivePhoto ? "livephoto" : "photo"))
-                            .font(.title3)
-                            .foregroundColor(.secondary)
-                    }
-                    
-                    // Metadata
-                    VStack(alignment: .leading, spacing: 2) {
-                        HStack(spacing: 6) {
-                            Text(item.formattedTotalSize)
-                                .font(.subheadline)
-                                .fontWeight(.bold)
-                            
-                            if isBest {
-                                Text("Best Quality")
-                                    .font(.system(size: 9, weight: .bold))
-                                    .padding(.horizontal, 6)
-                                    .padding(.vertical, 2)
-                                    .background(Color.green.opacity(0.15))
-                                    .foregroundColor(.green)
-                                    .cornerRadius(6)
-                            }
-                        }
-                        
-                        if item.isLivePhoto {
-                            Text("Still: \(item.formattedStillSize) • Mov: \(item.formattedVideoSize)")
-                                .font(.system(size: 10))
-                                .foregroundColor(.purple)
-                        } else if item.isVideo {
-                            Text("\(Int(item.duration))s • \(item.pixelWidth)×\(item.pixelHeight)")
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary)
-                        } else {
-                            Text("\(item.pixelWidth)×\(item.pixelHeight)")
-                                .font(.system(size: 10))
-                                .foregroundColor(.secondary)
-                        }
-                    }
-                    
-                    Spacer()
+            // Grid of Photos in Group
+            LazyVGrid(columns: gridColumns, spacing: 8) {
+                ForEach(group.items) { $item in
+                    gridPhotoCell(item: $item, bestID: group.wrappedValue.bestAssetID)
                 }
-                .padding(8)
-                .background(isBest ? Color.green.opacity(0.06) : Color.platformTertiaryBackground)
-                .cornerRadius(10)
             }
         }
         .padding(14)
         .background(Color.platformSecondaryBackground)
-        .cornerRadius(16)
+        .cornerRadius(18)
+    }
+    
+    private func gridPhotoCell(item: Binding<DedupeAssetItem>, bestID: String) -> some View {
+        let isBest = item.wrappedValue.id == bestID
+        let isSelected = item.wrappedValue.isSelectedForDeletion
+        
+        return ZStack(alignment: .topTrailing) {
+            // Photo Thumbnail (Tap to open full photo details)
+            AssetThumbnailView(assetID: item.wrappedValue.id)
+                .aspectRatio(1, contentMode: .fill)
+                .contentShape(Rectangle())
+                .onTapGesture {
+                    selectedDetailAssetID = item.wrappedValue.id
+                }
+                .overlay(
+                    // Bottom Size & Resolution Gradient
+                    VStack {
+                        Spacer()
+                        HStack {
+                            VStack(alignment: .leading, spacing: 1) {
+                                Text(item.wrappedValue.formattedTotalSize)
+                                    .font(.system(size: 10, weight: .bold))
+                                    .foregroundColor(.white)
+                                Text("\(item.wrappedValue.pixelWidth)×\(item.wrappedValue.pixelHeight)")
+                                    .font(.system(size: 8))
+                                    .foregroundColor(.white.opacity(0.8))
+                            }
+                            Spacer()
+                        }
+                        .padding(6)
+                        .background(
+                            LinearGradient(
+                                colors: [.clear, .black.opacity(0.75)],
+                                startPoint: .top,
+                                endPoint: .bottom
+                            )
+                        )
+                    }
+                )
+            
+            // Top Badges
+            HStack {
+                if isBest {
+                    HStack(spacing: 3) {
+                        Image(systemName: "star.fill")
+                            .font(.system(size: 8))
+                        Text("Best")
+                            .font(.system(size: 9, weight: .bold))
+                    }
+                    .padding(.horizontal, 6)
+                    .padding(.vertical, 3)
+                    .background(Color.green)
+                    .foregroundColor(.white)
+                    .cornerRadius(6)
+                    .padding(6)
+                }
+                
+                Spacer()
+                
+                // Deletion Checkbox
+                Button {
+                    if !isBest {
+                        item.isSelectedForDeletion.wrappedValue.toggle()
+                    }
+                } label: {
+                    Image(systemName: isSelected ? "checkmark.circle.fill" : "circle")
+                        .font(.title3)
+                        .foregroundColor(isSelected ? .red : .white)
+                        .shadow(radius: 3)
+                        .padding(6)
+                }
+                .disabled(isBest)
+            }
+        }
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+        .overlay(
+            RoundedRectangle(cornerRadius: 12)
+                .stroke(isBest ? Color.green : (isSelected ? Color.red.opacity(0.8) : Color.clear), lineWidth: 2)
+        )
     }
     
     private var cleanBottomBar: some View {

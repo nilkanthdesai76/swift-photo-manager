@@ -5,7 +5,7 @@ import PhotoManagerKit
 struct DemoApp: App {
     var body: some Scene {
         WindowGroup {
-            PhotoManagerDashboardView()
+            MainTabView(initialTab: 0)
         }
     }
 }

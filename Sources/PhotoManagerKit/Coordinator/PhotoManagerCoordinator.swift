@@ -29,6 +29,11 @@ public final class PhotoManagerCoordinator: ObservableObject {
     @Published public var videoSmartAlbums: [SmartAlbumItem] = []
     @Published public var largeVideosAlbum: SmartAlbumItem?
     
+    // AI & Timeline
+    @Published public var yearSections: [YearSection] = []
+    @Published public var aiCategories: [AICategoryItem] = []
+    @Published public var userAlbums: [UserAlbumItem] = []
+    
     @Published public var isIndexing: Bool = false
     @Published public var statusMessage: String = "Ready"
     
@@ -41,10 +46,14 @@ public final class PhotoManagerCoordinator: ObservableObject {
         self.cache = cache
     }
     
+    private var hasStarted = false
+    
     // MARK: - Lifecycle
     
     /// Instant startup sequence. Restores cached models in < 15ms, then starts background pipeline.
     public func start() async {
+        guard !hasStarted else { return }
+        hasStarted = true
         statusMessage = "Restoring library snapshot…"
         await cache.bootstrap()
         
@@ -108,6 +117,11 @@ public final class PhotoManagerCoordinator: ObservableObject {
         self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: sizeRecords)
         self.oldPhotosAlbum = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
         self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
+        
+        // AI & Timeline
+        self.yearSections = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
+        self.aiCategories = TimelineAndAIScanner.scanAICategories(photos: photos, sizeRecords: sizeRecords)
+        self.userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: sizeRecords)
         
         statusMessage = "Storage calculated (\(kvcStorage.totalCount) items)"
     }
@@ -205,17 +219,23 @@ public final class PhotoManagerCoordinator: ObservableObject {
                         videos: self.allVideos,
                         sizeRecords: self.sizeRecords
                     )
-                    self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: self.sizeRecords)
-                    self.videoSmartAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: self.allVideos, sizeRecords: self.sizeRecords)
-                    self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: self.allPhotos, sizeRecords: self.sizeRecords)
-                    self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: self.allVideos, sizeRecords: self.sizeRecords)
                 }
                 await cache.putSizeBatch(batch)
             }
         }
         
-        isIndexing = false
-        statusMessage = "Ready"
+        // Final background refresh once all batches complete - zero UI hitching
+        await MainActor.run {
+            self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: self.sizeRecords)
+            self.videoSmartAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: self.allVideos, sizeRecords: self.sizeRecords)
+            self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: self.allPhotos, sizeRecords: self.sizeRecords)
+            self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: self.allVideos, sizeRecords: self.sizeRecords)
+            self.yearSections = TimelineAndAIScanner.buildTimeline(photos: self.allPhotos, sizeRecords: self.sizeRecords)
+            self.aiCategories = TimelineAndAIScanner.scanAICategories(photos: self.allPhotos, sizeRecords: self.sizeRecords)
+            self.userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: self.sizeRecords)
+            self.isIndexing = false
+            self.statusMessage = "Ready"
+        }
     }
     
     // MARK: - Deletion Action
