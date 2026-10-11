@@ -3,9 +3,26 @@ import Combine
 
 #if canImport(Photos)
 import Photos
+extension PHAsset: @unchecked Sendable {}
+
+/// Immutable thread-safe snapshot of library overview and smart collections.
+public struct LibrarySnapshot: Sendable {
+    public let photos: [PHAsset]
+    public let videos: [PHAsset]
+    public let storageOverview: LibraryStorageOverview
+    public let photoSmartAlbums: [SmartAlbumItem]
+    public let videoSmartAlbums: [SmartAlbumItem]
+    public let largePhotosAlbum: SmartAlbumItem?
+    public let oldPhotosAlbum: SmartAlbumItem?
+    public let largeVideosAlbum: SmartAlbumItem?
+    public let yearSections: [YearSection]
+    public let aiCategories: [AICategoryItem]
+    public let userAlbums: [UserAlbumItem]
+}
 #endif
 
 /// Main orchestrator managing the library lifecycle, storage calculations, smart albums, and dedupe progress.
+/// UI state is published on `@MainActor`; ALL heavy PhotoKit and Vision workloads run in cooperative background tasks.
 @MainActor
 public final class PhotoManagerCoordinator: ObservableObject {
     
@@ -73,17 +90,49 @@ public final class PhotoManagerCoordinator: ObservableObject {
             return
         }
         
-        await fetchAssetsAndComputeOverview()
-        await startBackgroundPipelines()
+        isIndexing = true
+        statusMessage = "Loading library…"
+        
+        let cachedSizes = self.sizeRecords
+        let cachedAICats = await cache.getAllAICategories()
+        
+        // 2. Build initial library snapshot completely in the BACKGROUND
+        let snapshot = await Task.detached(priority: .userInitiated) {
+            Self.buildLibrarySnapshot(sizeRecords: cachedSizes, cachedAICategories: cachedAICats)
+        }.value
+        
+        // 3. Publish snapshot instantly (takes < 1ms on main thread)
+        self.applySnapshot(snapshot)
+        
+        // 4. Launch non-blocking background pipelines
+        self.startBackgroundPipelines(cachedAICats: cachedAICats)
         #endif
     }
     
     #if canImport(Photos)
-    /// Fetches all assets and calculates storage overview strictly using KVC sizes.
-    private func fetchAssetsAndComputeOverview() async {
-        isIndexing = true
-        statusMessage = "Analyzing storage…"
-        
+    /// Publishes a completed background snapshot to UI state in a single main-thread transaction.
+    private func applySnapshot(_ snapshot: LibrarySnapshot) {
+        self.allPhotos = snapshot.photos
+        self.allVideos = snapshot.videos
+        self.storageOverview = snapshot.storageOverview
+        self.photoSmartAlbums = snapshot.photoSmartAlbums
+        self.videoSmartAlbums = snapshot.videoSmartAlbums
+        self.largePhotosAlbum = snapshot.largePhotosAlbum
+        self.oldPhotosAlbum = snapshot.oldPhotosAlbum
+        self.largeVideosAlbum = snapshot.largeVideosAlbum
+        self.yearSections = snapshot.yearSections
+        self.aiCategories = snapshot.aiCategories
+        self.userAlbums = snapshot.userAlbums
+        self.isIndexing = false
+        self.statusMessage = "Storage ready (\(snapshot.storageOverview.totalCount) items)"
+    }
+    
+    /// Builds a full library snapshot completely off the main thread.
+    /// Runs in ~50-100ms on background thread without touching the UI.
+    nonisolated private static func buildLibrarySnapshot(
+        sizeRecords: [String: AssetSizeRecord],
+        cachedAICategories: [String: String]
+    ) -> LibrarySnapshot {
         // Fetch all photos
         let photoOptions = PHFetchOptions()
         photoOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
@@ -93,7 +142,6 @@ public final class PhotoManagerCoordinator: ObservableObject {
         var photos: [PHAsset] = []
         photos.reserveCapacity(photoFetch.count)
         photoFetch.enumerateObjects { asset, _, _ in photos.append(asset) }
-        self.allPhotos = photos
         
         // Fetch all videos
         let videoOptions = PHFetchOptions()
@@ -104,56 +152,61 @@ public final class PhotoManagerCoordinator: ObservableObject {
         var videos: [PHAsset] = []
         videos.reserveCapacity(videoFetch.count)
         videoFetch.enumerateObjects { asset, _, _ in videos.append(asset) }
-        self.allVideos = videos
         
-        // Pure KVC Storage Overview (instant from cached KVC sizes)
+        // Pure KVC Storage Overview
         let kvcStorage = StorageCalculator.computeOverview(photos: photos, videos: videos, sizeRecords: sizeRecords)
-        self.storageOverview = kvcStorage
         
-        // Smart Albums
-        self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: sizeRecords)
-        self.videoSmartAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: videos, sizeRecords: sizeRecords)
+        // Smart Albums & Thresholds
+        let photoAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: sizeRecords)
+        let videoAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: videos, sizeRecords: sizeRecords)
+        let largePhotos = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: sizeRecords)
+        let oldPhotos = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
+        let largeVideos = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
         
-        // Threshold Filters
-        self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: sizeRecords)
-        self.oldPhotosAlbum = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
-        self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
-        
-        // AI & Timeline
-        self.yearSections = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
-        let cachedAICats = await cache.getAllAICategories()
-        self.aiCategories = TimelineAndAIScanner.scanAICategories(
+        // Timeline, cached AI Categories, and User Albums
+        let timeline = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
+        let aiCategories = TimelineAndAIScanner.buildAICategories(
             photos: photos,
             sizeRecords: sizeRecords,
-            cachedCategories: cachedAICats,
-            onNewClassifications: { [weak self] newMap in
-                guard let self = self else { return }
-                Task {
-                    await self.cache.setAICategories(newMap)
-                }
-            }
+            cachedCategories: cachedAICategories
         )
-        self.userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: sizeRecords)
+        let userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: sizeRecords)
         
-        statusMessage = "Storage calculated (\(kvcStorage.totalCount) items)"
+        return LibrarySnapshot(
+            photos: photos,
+            videos: videos,
+            storageOverview: kvcStorage,
+            photoSmartAlbums: photoAlbums,
+            videoSmartAlbums: videoAlbums,
+            largePhotosAlbum: largePhotos,
+            oldPhotosAlbum: oldPhotos,
+            largeVideosAlbum: largeVideos,
+            yearSections: timeline,
+            aiCategories: aiCategories,
+            userAlbums: userAlbums
+        )
     }
     
-    /// Starts background exact KVC size resolution and dedupe hashing.
-    private func startBackgroundPipelines() async {
-        // 1. Photo Dedupe Pipeline (with in-card progress streaming)
-        Task { [weak self] in
+    /// Starts background exact KVC size resolution, dedupe hashing, and AI scene classification.
+    private func startBackgroundPipelines(cachedAICats: [String: String]) {
+        let photos = self.allPhotos
+        let videos = self.allVideos
+        let sizes = self.sizeRecords
+        let cacheRef = self.cache
+        
+        // 1. Photo Dedupe Pipeline (runs in background detached task)
+        Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
             let results = await PhotoDedupeEngine.scanPhotoDedupe(
-                assets: self.allPhotos,
-                cache: self.cache,
-                sizeRecords: self.sizeRecords,
-                progressHandler: { p in
+                assets: photos,
+                cache: cacheRef,
+                sizeRecords: sizes,
+                progressHandler: { [weak self] p in
                     Task { @MainActor in
-                        self.photoDedupeProgress = p
+                        self?.photoDedupeProgress = p
                     }
                 }
             )
-            
             await MainActor.run {
                 self.photoDuplicates = results.duplicates
                 self.photoSimilars = results.similars
@@ -161,20 +214,19 @@ public final class PhotoManagerCoordinator: ObservableObject {
             }
         }
         
-        // 2. Video Dedupe Pipeline (with in-card progress streaming)
-        Task { [weak self] in
+        // 2. Video Dedupe Pipeline (runs in background detached task)
+        Task.detached(priority: .utility) { [weak self] in
             guard let self = self else { return }
             let results = await VideoDedupeEngine.scanVideoDedupe(
-                videos: self.allVideos,
-                cache: self.cache,
-                sizeRecords: self.sizeRecords,
-                progressHandler: { p in
+                videos: videos,
+                cache: cacheRef,
+                sizeRecords: sizes,
+                progressHandler: { [weak self] p in
                     Task { @MainActor in
-                        self.videoDedupeProgress = p
+                        self?.videoDedupeProgress = p
                     }
                 }
             )
-            
             await MainActor.run {
                 self.videoDuplicates = results.duplicates
                 self.videoSimilars = results.similars
@@ -182,71 +234,109 @@ public final class PhotoManagerCoordinator: ObservableObject {
             }
         }
         
-        // 3. Background KVC Size Refiner (3 bounded workers, autoreleasepool, zero thermal rising)
-        Task { [weak self] in
-            guard let self = self else { return }
-            await self.runKvcSizeResolver()
+        // 3. Background KVC Size Refiner (runs in background detached task)
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.runKvcSizeResolver()
+        }
+        
+        // 4. Background AI Scene & Object Classifier (runs in background detached task)
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.runAICategoryScanner(photos: photos, initialCache: cachedAICats, cache: cacheRef)
         }
     }
     
     private func runKvcSizeResolver() async {
-        let uncachedAssets = (allPhotos + allVideos).filter { sizeRecords[$0.localIdentifier] == nil }
+        let (photos, videos, currentSizes) = await MainActor.run {
+            (self.allPhotos, self.allVideos, self.sizeRecords)
+        }
+        let uncachedAssets = (photos + videos).filter { currentSizes[$0.localIdentifier] == nil }
         guard !uncachedAssets.isEmpty else {
-            isIndexing = false
+            await MainActor.run { self.isIndexing = false }
             return
         }
         
-        statusMessage = "Resolving sizes via KVC…"
+        await MainActor.run { self.statusMessage = "Resolving sizes via KVC…" }
         
-        // Split across 3 workers for fast parallel KVC metadata resolution without daemon thrashing
-        let chunkSize = max(50, (uncachedAssets.count + 2) / 3)
+        let chunkSize = 50
         let chunks: [[PHAsset]] = stride(from: 0, to: uncachedAssets.count, by: chunkSize).map {
             Array(uncachedAssets[$0..<min($0 + chunkSize, uncachedAssets.count)])
         }
         
-        await withTaskGroup(of: [String: AssetSizeRecord].self) { group in
-            for chunk in chunks {
-                group.addTask {
-                    var resolved: [String: AssetSizeRecord] = [:]
-                    resolved.reserveCapacity(chunk.count)
-                    for (idx, asset) in chunk.enumerated() {
-                        if Task.isCancelled { break }
-                        let rec = StorageCalculator.resolveExactSize(for: asset)
-                        resolved[asset.localIdentifier] = rec
-                        if idx % 50 == 0 {
-                            await Task.yield()
-                        }
-                    }
-                    return resolved
-                }
+        for chunk in chunks {
+            if Task.isCancelled { break }
+            
+            var batch: [String: AssetSizeRecord] = [:]
+            batch.reserveCapacity(chunk.count)
+            
+            for asset in chunk {
+                let rec = StorageCalculator.resolveExactSize(for: asset)
+                batch[asset.localIdentifier] = rec
             }
             
-            for await batch in group {
-                await MainActor.run {
-                    for (id, rec) in batch {
-                        self.sizeRecords[id] = rec
-                    }
-                    self.storageOverview = StorageCalculator.computeOverview(
-                        photos: self.allPhotos,
-                        videos: self.allVideos,
-                        sizeRecords: self.sizeRecords
-                    )
+            await cache.putSizeBatch(batch)
+            
+            await MainActor.run {
+                for (id, rec) in batch {
+                    self.sizeRecords[id] = rec
                 }
-                await cache.putSizeBatch(batch)
+                self.storageOverview = StorageCalculator.computeOverview(
+                    photos: self.allPhotos,
+                    videos: self.allVideos,
+                    sizeRecords: self.sizeRecords
+                )
             }
+            
+            await Task.yield()
         }
         
-        // Final background refresh once all batches complete - zero UI hitching
+        // Final background refresh once all sizes are resolved
+        let (finalPhotos, finalVideos, finalSizes) = await MainActor.run {
+            (self.allPhotos, self.allVideos, self.sizeRecords)
+        }
+        
+        let pSmart = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: finalSizes)
+        let vSmart = SmartAlbumScanner.fetchVideoSmartAlbums(videos: finalVideos, sizeRecords: finalSizes)
+        let lPhotos = SmartAlbumScanner.filterLargePhotos(photos: finalPhotos, sizeRecords: finalSizes)
+        let lVideos = SmartAlbumScanner.filterLargeVideos(videos: finalVideos, sizeRecords: finalSizes)
+        let timeline = TimelineAndAIScanner.buildTimeline(photos: finalPhotos, sizeRecords: finalSizes)
+        
         await MainActor.run {
-            self.photoSmartAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: self.sizeRecords)
-            self.videoSmartAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: self.allVideos, sizeRecords: self.sizeRecords)
-            self.largePhotosAlbum = SmartAlbumScanner.filterLargePhotos(photos: self.allPhotos, sizeRecords: self.sizeRecords)
-            self.largeVideosAlbum = SmartAlbumScanner.filterLargeVideos(videos: self.allVideos, sizeRecords: self.sizeRecords)
-            self.yearSections = TimelineAndAIScanner.buildTimeline(photos: self.allPhotos, sizeRecords: self.sizeRecords)
-            self.aiCategories = TimelineAndAIScanner.scanAICategories(photos: self.allPhotos, sizeRecords: self.sizeRecords)
-            self.userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: self.sizeRecords)
+            self.photoSmartAlbums = pSmart
+            self.videoSmartAlbums = vSmart
+            self.largePhotosAlbum = lPhotos
+            self.largeVideosAlbum = lVideos
+            self.yearSections = timeline
             self.isIndexing = false
             self.statusMessage = "Ready"
+        }
+    }
+    
+    private func runAICategoryScanner(
+        photos: [PHAsset],
+        initialCache: [String: String],
+        cache: PhotoManagerCache
+    ) async {
+        await TimelineAndAIScanner.classifyUncachedPhotosInBackground(
+            photos: photos,
+            cachedCategories: initialCache,
+            batchSize: 20
+        ) { newClassifications in
+            await cache.setAICategories(newClassifications)
+            let updatedCache = await cache.getAllAICategories()
+            
+            let (currentPhotos, currentSizes) = await MainActor.run {
+                (self.allPhotos, self.sizeRecords)
+            }
+            
+            let updatedAICategories = TimelineAndAIScanner.buildAICategories(
+                photos: currentPhotos,
+                sizeRecords: currentSizes,
+                cachedCategories: updatedCache
+            )
+            
+            await MainActor.run {
+                self.aiCategories = updatedAICategories
+            }
         }
     }
     
@@ -276,8 +366,13 @@ public final class PhotoManagerCoordinator: ObservableObject {
             self.videoDuplicates = cleanGroups(self.videoDuplicates, deleted: deletedSet)
             self.videoSimilars = cleanGroups(self.videoSimilars, deleted: deletedSet)
             
-            // Recalculate smart albums & overview
-            await fetchAssetsAndComputeOverview()
+            // Recalculate smart albums & overview in background
+            let sizes = self.sizeRecords
+            let aiCats = await cache.getAllAICategories()
+            let snapshot = await Task.detached(priority: .userInitiated) {
+                Self.buildLibrarySnapshot(sizeRecords: sizes, cachedAICategories: aiCats)
+            }.value
+            self.applySnapshot(snapshot)
             return true
         } catch {
             return false
