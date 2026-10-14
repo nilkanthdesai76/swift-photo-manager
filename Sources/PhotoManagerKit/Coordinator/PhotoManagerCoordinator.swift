@@ -339,8 +339,14 @@ public final class PhotoManagerCoordinator {
             await sizeFetchTask
             if Task.isCancelled { return }
             
-            let sizeIndex = await MainActor.run { self.sizeRecords }
-            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
+            let completedSizes = await cacheRef.getAllSizes()
+            await MainActor.run {
+                self.sizeRecords = completedSizes
+                self.refreshGroupSizes()
+            }
+            
+            // Build the Blurry Photos album with the complete size index for accurate totals.
+            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: completedSizes, cache: cacheRef)
             
             // Wait for AI sorting to finish before declaring the pipeline complete.
             await aiTask
@@ -668,6 +674,31 @@ public final class PhotoManagerCoordinator {
     
     // MARK: - Process Dashboard Actions
     
+    /// Backfills byte totals on published dedupe groups from the completed size index.
+    /// Grouping itself never waits on sizes; this runs once sizes are available.
+    public func refreshGroupSizes() {
+        let sizes = self.sizeRecords
+        func refreshed(_ groups: [DedupeGroup]) -> [DedupeGroup] {
+            groups.map { group in
+                var g = group
+                g.items = group.items.map { item in
+                    var it = item
+                    if let rec = sizes[item.id] {
+                        it.totalBytes = rec.totalBytes
+                        it.stillBytes = rec.stillBytes
+                        it.videoBytes = rec.videoBytes
+                    }
+                    return it
+                }
+                return g
+            }
+        }
+        photoDuplicates = refreshed(photoDuplicates)
+        photoSimilars = refreshed(photoSimilars)
+        videoDuplicates = refreshed(videoDuplicates)
+        videoSimilars = refreshed(videoSimilars)
+    }
+    
     /// True while a dashboard-triggered process is running under the given key.
     public func isProcessRunning(_ key: String) -> Bool {
         processTasks[key] != nil
@@ -814,7 +845,10 @@ public final class PhotoManagerCoordinator {
                 qos: .utility
             )
             let sizes = await cacheRef.getAllSizes()
-            await MainActor.run { self.sizeRecords = sizes }
+            await MainActor.run {
+                self.sizeRecords = sizes
+                self.refreshGroupSizes()
+            }
             await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizes, cache: cacheRef)
             await MainActor.run { self.unregister("sizes") }
         }

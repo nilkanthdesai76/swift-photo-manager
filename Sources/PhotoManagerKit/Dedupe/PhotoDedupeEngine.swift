@@ -430,22 +430,11 @@ public enum PhotoDedupeEngine {
             }
         }
         
-        // Resolve sizes for ALL group members concurrently — never block the cluster loops above.
-        // This is the expensive tail of grouping, so it reports its own visible progress.
-        let groupedAssets = (rawExactGroups + rawSimilarGroups).flatMap { $0 }
-        let resolvedSizes = await StorageCalculator.resolveMissingSizes(
-            for: groupedAssets,
-            existing: sizeRecords,
-            maxConcurrent: 16,
-            progressHandler: { resolved, total in
-                progressHandler?(
-                    ScanProgress(processed: resolved, total: total, isScanning: true, label: "Resolving sizes")
-                )
-            }
-        )
-        
-        let duplicates = rawExactGroups.map { makeGroup(from: $0, kind: .exactDuplicate, sizeRecords: resolvedSizes) }
-        let similars = rawSimilarGroups.map { makeGroup(from: $0, kind: .similar, sizeRecords: resolvedSizes) }
+        // Grouping is purely hash/dimension based and must NOT wait on size I/O.
+        // Byte totals use whatever sizes are already indexed; the coordinator backfills
+        // the remaining totals from the size index once the size fetch completes.
+        let duplicates = rawExactGroups.map { makeGroup(from: $0, kind: .exactDuplicate, sizeRecords: sizeRecords) }
+        let similars = rawSimilarGroups.map { makeGroup(from: $0, kind: .similar, sizeRecords: sizeRecords) }
         
         return (duplicates, similars)
     }
