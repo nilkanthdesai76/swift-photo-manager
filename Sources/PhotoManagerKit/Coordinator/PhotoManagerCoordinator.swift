@@ -216,12 +216,13 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    /// Starts the fully independent background pipeline.
+    /// Starts the background pipeline in two waves:
     ///
-    /// Photo scan, video scan, and the size-fetch trickle are three fully independent detached tasks.
-    /// Nothing blocks on the size fetch: each dedupe task hashes AND clusters on its own, and groups
-    /// are published the moment each scan completes. The size fetch only trickles (2 workers,
-    /// background QoS) while the scans run, then escalates to full speed once both scans finish.
+    /// Wave 1 (top priority): photo hashing + grouping AND video fingerprinting + grouping run
+    /// concurrently and complete FIRST — nothing else competes with them.
+    ///
+    /// Wave 2: once both dedupe scans finish, size fetching (full speed) and AI categorization
+    /// start TOGETHER and run concurrently. The blur album builds after the size index completes.
     private func startBackgroundPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
         let videos = self.allVideos
@@ -231,32 +232,18 @@ public final class PhotoManagerCoordinator {
             guard let self = self else { return }
             
             await MainActor.run {
-                self.currentStep = .fetchingSizes
+                self.currentStep = .photoDedupe
                 self.isIndexing = true
-                self.statusMessage = "Scanning library…"
+                self.statusMessage = "Scanning photo duplicates…"
             }
             
-            let initialSizes = await MainActor.run { self.sizeRecords }
-            
-            // Size fetch TRICKLE: fully independent, lowest priority, few workers.
-            let sizeTrickleTask = Task.detached(priority: .background) {
-                await self.runKvcSizeResolver(
-                    photos: photos,
-                    videos: videos,
-                    initialSizes: initialSizes,
-                    cache: cacheRef,
-                    maxConcurrent: 2,
-                    qos: .background
-                )
-            }
-            
-            // Independent photo scan task: hashes + clusters, publishes groups on completion.
+            // Independent photo scan task: hashes + clusters.
             let photoScanTask = Task<DedupeScanResult, Never>.detached(priority: .userInitiated) { [weak self] in
                 guard let self = self else { return DedupeScanResult(duplicates: [], similars: []) }
                 return await self.runPhotoScan(assets: photos, cache: cacheRef)
             }
             
-            // Independent video scan task: fingerprints + clusters, publishes groups on completion.
+            // Independent video scan task: fingerprints + clusters.
             let videoScanTask = Task<DedupeScanResult, Never>.detached(priority: .userInitiated) { [weak self] in
                 guard let self = self else { return DedupeScanResult(duplicates: [], similars: []) }
                 return await self.runVideoScan(videos: videos, cache: cacheRef)
@@ -281,47 +268,46 @@ public final class PhotoManagerCoordinator {
             }
             
             // ==========================================
-            // FULL-SPEED SIZE FETCH for the remaining uncached assets.
-            // Both scans are done, so the size fetch now gets full workers + utility QoS.
+            // WAVE 2: SIZE FETCH + AI SORTING START TOGETHER (concurrent, full speed)
             // ==========================================
-            await sizeTrickleTask.value
             if Task.isCancelled { return }
             
-            let trickleProgress = await cacheRef.getAllSizes()
+            let currentSizes = await MainActor.run { self.sizeRecords }
             
             await MainActor.run {
                 self.currentStep = .fetchingSizes
                 self.statusMessage = "Indexing asset sizes…"
             }
             
-            await self.runKvcSizeResolver(
+            async let sizeFetchTask: Void = self.runKvcSizeResolver(
                 photos: photos,
                 videos: videos,
-                initialSizes: trickleProgress,
+                initialSizes: currentSizes,
                 cache: cacheRef,
                 maxConcurrent: max(8, min(16, ProcessInfo.processInfo.processorCount)),
                 qos: .utility
             )
             
-            if Task.isCancelled { return }
-            
-            let sizeIndex = await MainActor.run { self.sizeRecords }
-            
-            // Build the Blurry Photos album with the complete size index for accurate totals.
-            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
-            
-            // ==========================================
-            // AI SORTING
-            // ==========================================
             await MainActor.run {
                 self.currentStep = .aiSorting
                 self.statusMessage = "Categorizing photos with AI Vision…"
             }
-            await self.runAICategoryScanner(
+            async let aiTask: Void = self.runAICategoryScanner(
                 photos: photos,
                 initialCache: cachedAICats,
                 cache: cacheRef
             )
+            
+            // Blur album needs the complete size index — build it as soon as sizes finish.
+            await sizeFetchTask
+            if Task.isCancelled { return }
+            
+            let sizeIndex = await MainActor.run { self.sizeRecords }
+            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
+            
+            // Wait for AI sorting to finish before declaring the pipeline complete.
+            await aiTask
+            if Task.isCancelled { return }
             
             // ==========================================
             // PIPELINE COMPLETE
