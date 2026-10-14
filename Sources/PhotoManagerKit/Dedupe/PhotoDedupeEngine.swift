@@ -28,28 +28,64 @@ public enum PhotoDedupeEngine {
         }
         
         let totalCount = assets.count
-        let cachedHashes = await cache.getAllPhotoHashes()
+        let hashMap = await hashAndCachePhotos(assets: assets, cache: cache, progressHandler: progressHandler)
+        
+        // Build the ordered (asset, hash) list the clusterer expects.
         var assetHashes: [(asset: PHAsset, hash: UInt64)] = []
         assetHashes.reserveCapacity(totalCount)
+        for asset in assets {
+            if let h = hashMap[asset.localIdentifier] {
+                assetHashes.append((asset, h))
+            }
+        }
+        
+        // Fast Cluster into Duplicate & Similar Groups (< 50ms for 50k assets, < 5MB RAM)
+        let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords)
+        await cache.putPhotoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
+        progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
+        return clustered
+    }
+    
+    /// Warms the hash cache for all photos without clustering. Safe to run concurrently with
+    /// size fetching so that hashing wall-clock time overlaps the I/O-bound size index build.
+    public static func warmPhotoHashCache(
+        assets: [PHAsset],
+        cache: PhotoManagerCache = .shared,
+        progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
+    ) async {
+        guard !assets.isEmpty else { return }
+        _ = await hashAndCachePhotos(assets: assets, cache: cache, progressHandler: progressHandler)
+    }
+    
+    /// Hashes every photo that isn't already cached, persists the hashes (and blur flags), and
+    /// returns a complete ID→hash map including previously cached entries.
+    private static func hashAndCachePhotos(
+        assets: [PHAsset],
+        cache: PhotoManagerCache,
+        progressHandler: (@Sendable (ScanProgress) -> Void)?
+    ) async -> [String: UInt64] {
+        let totalCount = assets.count
+        let cachedHashes = await cache.getAllPhotoHashes()
+        var resultHashes = cachedHashes
+        resultHashes.reserveCapacity(totalCount)
         
         var uncachedAssets: [PHAsset] = []
         uncachedAssets.reserveCapacity(min(totalCount, 5000))
         
         // Step 1: Check in-memory hash cache (< 2ms)
         for asset in assets {
-            if let h = cachedHashes[asset.localIdentifier] {
-                assetHashes.append((asset, h))
-            } else {
+            if cachedHashes[asset.localIdentifier] == nil {
                 uncachedAssets.append(asset)
             }
         }
         
-        let alreadyProcessed = assetHashes.count
+        let alreadyProcessed = totalCount - uncachedAssets.count
+        // Scan is underway even when every hash was cached (clustering will follow in scanPhotoDedupe).
         progressHandler?(
             ScanProgress(
                 processed: alreadyProcessed,
                 total: totalCount,
-                isScanning: !uncachedAssets.isEmpty
+                isScanning: true
             )
         )
         
@@ -64,6 +100,8 @@ public enum PhotoDedupeEngine {
             
             var batchHashes: [String: UInt64] = [:]
             batchHashes.reserveCapacity(250)
+            var batchBlurry: [String] = []
+            batchBlurry.reserveCapacity(50)
             
             var currentProcessed = alreadyProcessed
             let targetSize = CGSize(width: 32, height: 32) // Ultra-fast thumbnail
@@ -71,14 +109,19 @@ public enum PhotoDedupeEngine {
             for asset in uncachedAssets {
                 if Task.isCancelled { break }
                 
-                let hash = await computeHash(for: asset, manager: imageManager, options: requestOptions, targetSize: targetSize)
-                assetHashes.append((asset, hash))
-                batchHashes[asset.localIdentifier] = hash
+                let result = await computeHash(for: asset, manager: imageManager, options: requestOptions, targetSize: targetSize)
+                resultHashes[asset.localIdentifier] = result.hash
+                batchHashes[asset.localIdentifier] = result.hash
+                if result.isBlurry {
+                    batchBlurry.append(asset.localIdentifier)
+                }
                 currentProcessed += 1
                 
                 if batchHashes.count >= 200 {
                     await cache.putPhotoHashes(batchHashes)
                     batchHashes.removeAll(keepingCapacity: true)
+                    await cache.putBlurryPhotoIDs(batchBlurry)
+                    batchBlurry.removeAll(keepingCapacity: true)
                     await Task.yield()
                 }
                 
@@ -96,13 +139,12 @@ public enum PhotoDedupeEngine {
             if !batchHashes.isEmpty {
                 await cache.putPhotoHashes(batchHashes)
             }
+            if !batchBlurry.isEmpty {
+                await cache.putBlurryPhotoIDs(batchBlurry)
+            }
         }
         
-        // Step 3: Fast Cluster into Duplicate & Similar Groups (< 50ms for 50k assets, < 5MB RAM)
-        let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords)
-        await cache.putPhotoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
-        progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
-        return clustered
+        return resultHashes
     }
     
     // MARK: - Perceptual Difference Hashing (dHash)
@@ -112,7 +154,7 @@ public enum PhotoDedupeEngine {
         manager: PHImageManager,
         options: PHImageRequestOptions,
         targetSize: CGSize
-    ) async -> UInt64 {
+    ) async -> (hash: UInt64, isBlurry: Bool) {
         return await withCheckedContinuation { continuation in
             _ = autoreleasepool {
                 manager.requestImage(
@@ -122,15 +164,15 @@ public enum PhotoDedupeEngine {
                     options: options
                 ) { image, _ in
                     #if canImport(UIKit)
-                    if let cgImage = image?.cgImage {
-                        let h = computeDHash64(from: cgImage)
-                        continuation.resume(returning: h)
+                    if let cgImage = image?.cgImage, let raw = sampleGrayBytes(from: cgImage, width: 9, height: 8) {
+                        let h = dHash(fromRaw: raw, width: 9, height: 8)
+                        continuation.resume(returning: (h, isBlurryPhoto(raw, width: 9, height: 8)))
                         return
                     }
                     #endif
                     // Fallback deterministic hash from aspect ratio + date if image unavailable
                     let fallback = UInt64(asset.pixelWidth ^ asset.pixelHeight ^ Int(asset.creationDate?.timeIntervalSince1970 ?? 0))
-                    continuation.resume(returning: fallback)
+                    continuation.resume(returning: (fallback, false))
                 }
             }
         }
@@ -138,39 +180,79 @@ public enum PhotoDedupeEngine {
     
     /// Computes 64-bit gradient difference hash (dHash) from a CGImage.
     public static func computeDHash64(from image: CGImage) -> UInt64 {
-        let width = 9
-        let height = 8
-        let bytesPerPixel = 1
-        let bytesPerRow = width * bytesPerPixel
+        guard let rawData = sampleGrayBytes(from: image, width: 9, height: 8) else { return 0 }
+        return dHash(fromRaw: rawData, width: 9, height: 8)
+    }
+    
+    /// Renders an image into a grayscale byte buffer (device gray, no alpha).
+    private static func sampleGrayBytes(from image: CGImage, width: Int, height: Int) -> [UInt8]? {
         var rawData = [UInt8](repeating: 0, count: width * height)
-        
         let colorSpace = CGColorSpaceCreateDeviceGray()
         guard let context = CGContext(
             data: &rawData,
             width: width,
             height: height,
             bitsPerComponent: 8,
-            bytesPerRow: bytesPerRow,
+            bytesPerRow: width,
             space: colorSpace,
             bitmapInfo: CGImageAlphaInfo.none.rawValue
         ) else {
-            return 0
+            return nil
         }
-        
         context.draw(image, in: CGRect(x: 0, y: 0, width: width, height: height))
-        
+        return rawData
+    }
+    
+    private static func dHash(fromRaw rawData: [UInt8], width: Int, height: Int) -> UInt64 {
         var hash: UInt64 = 0
         for y in 0..<height {
             let rowOffset = y * width
-            for x in 0..<8 {
+            for x in 0..<(width - 1) {
                 let left = rawData[rowOffset + x]
                 let right = rawData[rowOffset + x + 1]
                 if left > right {
-                    hash |= (1 << (y * 8 + x))
+                    hash |= (1 << (y * (width - 1) + x))
                 }
             }
         }
         return hash
+    }
+    
+    // MARK: - Blur Detection
+    
+    /// Gradient-energy threshold below which edges are considered soft (0-255 scale).
+    private static let blurGradientThreshold = 6.0
+    /// Minimum intensity standard deviation required to count as a "real" detailed scene.
+    /// Prevents flat scenes (skies, walls) from being flagged just because they lack edges.
+    private static let blurDetailStdDev = 18.0
+    
+    /// Cheap blur heuristic on the same 9x8 grayscale sample used for hashing:
+    /// a photo is blurry when it has real tonal detail (high std dev) but very soft edges (low mean gradient).
+    static func isBlurryPhoto(_ rawData: [UInt8], width: Int, height: Int) -> Bool {
+        let count = rawData.count
+        guard count > 1 else { return false }
+        
+        var sum = 0
+        for b in rawData { sum += Int(b) }
+        let mean = Double(sum) / Double(count)
+        
+        var variance = 0.0
+        for b in rawData {
+            let d = Double(b) - mean
+            variance += d * d
+        }
+        let stdDev = (variance / Double(count)).squareRoot()
+        guard stdDev > blurDetailStdDev else { return false }
+        
+        var gradientSum = 0
+        for y in 0..<height {
+            let rowOffset = y * width
+            for x in 0..<(width - 1) {
+                gradientSum += abs(Int(rawData[rowOffset + x]) - Int(rawData[rowOffset + x + 1]))
+            }
+        }
+        let gradientMean = Double(gradientSum) / Double(height * (width - 1))
+        return gradientMean < blurGradientThreshold
     }
     
     /// Computes Hamming distance between two 64-bit hashes.

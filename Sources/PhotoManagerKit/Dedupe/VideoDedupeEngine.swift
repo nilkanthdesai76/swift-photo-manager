@@ -45,11 +45,12 @@ public enum VideoDedupeEngine {
         }
         
         let alreadyProcessed = videoRecords.count
+        // Scan is underway (clustering included) even when every fingerprint was cached.
         progressHandler?(
             ScanProgress(
                 processed: alreadyProcessed,
                 total: totalCount,
-                isScanning: !uncachedVideos.isEmpty
+                isScanning: true
             )
         )
         

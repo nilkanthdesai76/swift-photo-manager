@@ -94,6 +94,17 @@ public struct DedupeProgressCardView: View {
                         Image(systemName: "chevron.right")
                             .font(.caption)
                             .foregroundColor(.secondary)
+                    } else if progress.total == 0 {
+                        // Scan not started yet for this card — show an indeterminate waiting state
+                        // instead of a misleading "Clean" badge.
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Waiting")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                        }
                     } else {
                         // Clean state
                         HStack(spacing: 4) {

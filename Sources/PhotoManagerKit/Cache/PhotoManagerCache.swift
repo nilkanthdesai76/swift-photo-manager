@@ -57,6 +57,7 @@ public actor PhotoManagerCache {
     private var videoDuplicates: [DedupeGroup] = []
     private var videoSimilars: [DedupeGroup] = []
     private var aiCategories: [String: String] = [:]
+    private var blurryPhotoIDs: Set<String> = []
     
     private var isDirty = false
     private var didBootstrap = false
@@ -71,6 +72,7 @@ public actor PhotoManagerCache {
         var videoDuplicates: [DedupeGroup]
         var videoSimilars: [DedupeGroup]
         var aiCategories: [String: String]?
+        var blurryPhotoIDs: [String]?
     }
     
     public init() {
@@ -96,6 +98,7 @@ public actor PhotoManagerCache {
             self.videoDuplicates = env.videoDuplicates
             self.videoSimilars = env.videoSimilars
             self.aiCategories = env.aiCategories ?? [:]
+            self.blurryPhotoIDs = Set(env.blurryPhotoIDs ?? [])
         }
     }
     
@@ -203,6 +206,20 @@ public actor PhotoManagerCache {
         aiCategories
     }
     
+    // MARK: - Blurry Photos
+    
+    /// IDs of photos flagged as blurry by the perceptual-hash pass. Only blurry IDs are stored.
+    public func getBlurryPhotoIDs() -> Set<String> {
+        blurryPhotoIDs
+    }
+    
+    public func putBlurryPhotoIDs(_ ids: [String]) {
+        guard !ids.isEmpty else { return }
+        blurryPhotoIDs.formUnion(ids)
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
     // MARK: - Persistence
     
     public func flush() async {
@@ -217,7 +234,8 @@ public actor PhotoManagerCache {
             photoSimilars: photoSimilars,
             videoDuplicates: videoDuplicates,
             videoSimilars: videoSimilars,
-            aiCategories: aiCategories
+            aiCategories: aiCategories,
+            blurryPhotoIDs: Array(blurryPhotoIDs)
         )
         let url = fileURL
         
@@ -238,6 +256,7 @@ public actor PhotoManagerCache {
         videoDuplicates.removeAll()
         videoSimilars.removeAll()
         aiCategories.removeAll()
+        blurryPhotoIDs.removeAll()
         isDirty = false
         try? FileManager.default.removeItem(at: fileURL)
     }

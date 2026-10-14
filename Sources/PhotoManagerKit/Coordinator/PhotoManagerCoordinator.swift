@@ -58,6 +58,9 @@ public final class PhotoManagerCoordinator {
     public var videoSmartAlbums: [SmartAlbumItem] = []
     public var largeVideosAlbum: SmartAlbumItem?
     
+    // Blur detection (populated from the photo hashing pass)
+    public var blurryPhotosAlbum: SmartAlbumItem?
+    
     // AI & Timeline
     public var yearSections: [YearSection] = []
     public var aiCategories: [AICategoryItem] = []
@@ -68,6 +71,10 @@ public final class PhotoManagerCoordinator {
     public var statusMessage: String = "Ready"
     
     public var sizeRecords: [String: AssetSizeRecord] = [:]
+    
+    // MARK: - Size Index Scan (Phase 0) Granular Progress
+    public var sizeScanProgress: ScanProgress = .idle
+    public var sizeScanResolvedBytes: Int64 = 0
     
     @ObservationIgnored
     private let cache: PhotoManagerCache
@@ -206,9 +213,11 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    /// Starts background execution:
-    /// Phase 1: Exact KVC size resolution & Photo deduplication run concurrently alongside each other on utility threads.
-    /// Phase 2: Video deduplication.
+    /// Starts the background pipeline:
+    /// Phase 0: Exact KVC size resolution builds the reusable size index.
+    /// Phase 0.5: Photo hashing runs *concurrently* with Phase 0 so hashing wall-clock time overlaps size fetching.
+    /// Phase 1: Photo duplicate/similar clustering (reuses cached hashes + completed size index).
+    /// Phase 2: Video deduplication (reuses the completed size index).
     /// Phase 3: AI sorting.
     private func startBackgroundPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
@@ -219,17 +228,17 @@ public final class PhotoManagerCoordinator {
             guard let self = self else { return }
             
             // ==========================================
-            // PHASE 1: SIZE FETCH & PHOTO DEDUPE RUN CONCURRENTLY
+            // PHASE 0: BUILD THE SIZE INDEX
+            // PHASE 0.5: WARM PHOTO HASH CACHE (overlaps Phase 0)
             // ==========================================
             await MainActor.run {
-                self.currentStep = .photoDedupe
+                self.currentStep = .fetchingSizes
                 self.isIndexing = true
-                self.statusMessage = "Analyzing storage & scanning duplicates…"
+                self.statusMessage = "Indexing asset sizes…"
             }
             
             let initialSizes = await MainActor.run { self.sizeRecords }
             
-            // Launch KVC size resolution on utility background thread
             async let sizeResolverTask: Void = self.runKvcSizeResolver(
                 photos: photos,
                 videos: videos,
@@ -237,11 +246,9 @@ public final class PhotoManagerCoordinator {
                 cache: cacheRef
             )
             
-            // Launch photo dedupe concurrently on utility background thread
-            async let photoDedupeTask = PhotoDedupeEngine.scanPhotoDedupe(
+            async let photoHashWarmTask: Void = PhotoDedupeEngine.warmPhotoHashCache(
                 assets: photos,
                 cache: cacheRef,
-                sizeRecords: initialSizes,
                 progressHandler: { [weak self] p in
                     Task { @MainActor in
                         self?.photoDedupeProgress = p
@@ -252,15 +259,42 @@ public final class PhotoManagerCoordinator {
                 }
             )
             
-            let photoResults = await photoDedupeTask
+            _ = await (sizeResolverTask, photoHashWarmTask)
+            if Task.isCancelled { return }
+            
+            // Later phases reuse the completed size index from cache/state.
+            let sizeIndex = await MainActor.run { self.sizeRecords }
+            
+            // ==========================================
+            // PHASE 1: PHOTO DEDUPE CLUSTERING (cached hashes + complete size index)
+            // ==========================================
+            await MainActor.run {
+                self.currentStep = .photoDedupe
+                self.statusMessage = "Scanning photo duplicates…"
+            }
+            
+            let photoResults = await PhotoDedupeEngine.scanPhotoDedupe(
+                assets: photos,
+                cache: cacheRef,
+                sizeRecords: sizeIndex,
+                progressHandler: { [weak self] p in
+                    Task { @MainActor in
+                        self?.photoDedupeProgress = p
+                        if p.isScanning {
+                            self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
+                        }
+                    }
+                }
+            )
+            
             await MainActor.run {
                 self.photoDuplicates = photoResults.duplicates
                 self.photoSimilars = photoResults.similars
                 self.photoDedupeProgress = .done
             }
             
-            // Ensure size resolver is finished before proceeding to videos
-            _ = await sizeResolverTask
+            // Build the Blurry Photos album from flags collected during hashing (reuses size index).
+            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
             
             if Task.isCancelled { return }
             
@@ -314,9 +348,10 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    /// Resolves KVC file sizes completely on utility thread without freezing the main actor.
-    /// Accumulates byte sums in O(1) arithmetic and throttles UI updates to avoid main thread pressure.
-    private func runKvcSizeResolver(
+    /// Resolves KVC file sizes completely off the main actor (nonisolated) so PhotoKit property
+    /// faults never stack on the main queue. Publishes granular per-chunk progress so only the
+    /// targeted progress views re-render. Accumulates byte sums in O(1) arithmetic.
+    nonisolated private func runKvcSizeResolver(
         photos: [PHAsset],
         videos: [PHAsset],
         initialSizes: [String: AssetSizeRecord],
@@ -325,7 +360,12 @@ public final class PhotoManagerCoordinator {
         let uncachedAssets = (photos + videos).filter { initialSizes[$0.localIdentifier] == nil }
         guard !uncachedAssets.isEmpty else { return }
         
-        let chunkSize = 100
+        let scanTotal = uncachedAssets.count
+        await MainActor.run {
+            self.sizeScanProgress = ScanProgress(processed: 0, total: scanTotal, isScanning: true)
+        }
+        
+        let chunkSize = 50
         let chunks: [[PHAsset]] = stride(from: 0, to: uncachedAssets.count, by: chunkSize).map {
             Array(uncachedAssets[$0..<min($0 + chunkSize, uncachedAssets.count)])
         }
@@ -347,61 +387,142 @@ public final class PhotoManagerCoordinator {
         
         var accumulatedBatch: [String: AssetSizeRecord] = [:]
         accumulatedBatch.reserveCapacity(250)
+        var processedCount = 0
         
-        for (chunkIndex, chunk) in chunks.enumerated() {
-            if Task.isCancelled { break }
-            
+        // Bounded pipeline: keep a fixed number of chunk tasks in flight at all times.
+        // This maximizes Photos daemon throughput while a slow chunk (e.g. iCloud/network)
+        // never blocks fast chunks, and everything stays off the main actor.
+        // Use at least 6 workers, scaling up to the total core count of the device.
+        let maxConcurrent = max(6, ProcessInfo.processInfo.processorCount)
+        let chunkStream = AsyncStream<[PHAsset]> { continuation in
+            for chunk in chunks { continuation.yield(chunk) }
+            continuation.finish()
+        }
+        
+        typealias ChunkResult = (
+            batch: [String: AssetSizeRecord],
+            bytes: Int64,
+            photosBytes: Int64,
+            lpStill: Int64,
+            lpVideo: Int64,
+            videosBytes: Int64
+        )
+        
+        @Sendable func processChunk(_ chunk: [PHAsset]) -> ChunkResult {
             var batch: [String: AssetSizeRecord] = [:]
             batch.reserveCapacity(chunk.count)
+            var photosBytes: Int64 = 0
+            var lpStill: Int64 = 0
+            var lpVideo: Int64 = 0
+            var videosBytes: Int64 = 0
             
             autoreleasepool {
                 for asset in chunk {
+                    if Task.isCancelled { break }
                     let rec = StorageCalculator.resolveExactSize(for: asset)
                     batch[asset.localIdentifier] = rec
                     
                     if asset.mediaType == .video {
-                        runningVideosBytes += rec.totalBytes
+                        videosBytes += rec.totalBytes
                     } else if asset.mediaSubtypes.contains(.photoLive) {
-                        runningLPStillBytes += rec.stillBytes
-                        runningLPVideoBytes += rec.videoBytes
+                        lpStill += rec.stillBytes
+                        lpVideo += rec.videoBytes
                     } else {
-                        runningPhotosBytes += rec.totalBytes
+                        photosBytes += rec.totalBytes
                     }
                 }
             }
             
-            accumulatedBatch.merge(batch) { _, new in new }
-            await cache.putSizeBatch(batch)
+            let bytes = batch.values.reduce(Int64(0)) { $0 + $1.totalBytes }
+            return (batch, bytes, photosBytes, lpStill, lpVideo, videosBytes)
+        }
+        
+        await withTaskGroup(of: ChunkResult.self) { group in
+            var iterator = chunkStream.makeAsyncIterator()
+            var inFlight = 0
+            var streamExhausted = false
             
-            // Dispatch UI updates periodically every 200 items or on last chunk (takes < 0.05ms on MainActor)
-            let isLastChunk = chunkIndex == chunks.count - 1
-            if accumulatedBatch.count >= 200 || isLastChunk {
-                let updatedOverview = LibraryStorageOverview(
-                    totalBytes: runningPhotosBytes + runningLPStillBytes + runningLPVideoBytes + runningVideosBytes,
-                    totalCount: totalCount,
-                    photosBytes: runningPhotosBytes,
-                    photosCount: regularPhotoCount,
-                    livePhotosTotalBytes: runningLPStillBytes + runningLPVideoBytes,
-                    livePhotosStillBytes: runningLPStillBytes,
-                    livePhotosVideoBytes: runningLPVideoBytes,
-                    livePhotosCount: lpCount,
-                    videosBytes: runningVideosBytes,
-                    videosCount: videoCount,
-                    otherBytes: 0,
-                    otherCount: 0,
-                    isEstimated: false
-                )
-                
-                let dispatchBatch = accumulatedBatch
-                accumulatedBatch.removeAll(keepingCapacity: true)
-                
-                await MainActor.run {
-                    self.sizeRecords.merge(dispatchBatch) { _, new in new }
-                    self.storageOverview = updatedOverview
+            func spawnNext() async {
+                guard !streamExhausted, let chunk = await iterator.next() else {
+                    streamExhausted = true
+                    return
                 }
+                group.addTask { processChunk(chunk) }
+                inFlight += 1
             }
             
-            await Task.yield()
+            // Prime the pipeline
+            while inFlight < maxConcurrent {
+                await spawnNext()
+                if streamExhausted { break }
+            }
+            
+            // Drain results and keep the pipe full until no work remains
+            while inFlight > 0 {
+                if Task.isCancelled {
+                    group.cancelAll()
+                    break
+                }
+                
+                guard let result = await group.next() else { break }
+                inFlight -= 1
+                
+                if result.batch.isEmpty { continue }
+                
+                await cache.putSizeBatch(result.batch)
+                accumulatedBatch.merge(result.batch) { _, new in new }
+                runningPhotosBytes += result.photosBytes
+                runningLPStillBytes += result.lpStill
+                runningLPVideoBytes += result.lpVideo
+                runningVideosBytes += result.videosBytes
+                processedCount += result.batch.count
+                
+                // Publish progress every completed chunk — 50k assets ≈ 500 tiny MainActor hops.
+                let snapshot = ScanProgress(processed: processedCount, total: scanTotal, isScanning: true)
+                let chunkBytes = result.bytes
+                await MainActor.run {
+                    self.sizeScanProgress = snapshot
+                    self.sizeScanResolvedBytes += chunkBytes
+                }
+                
+                // Dispatch storage overview / sizeRecords batch every ~200 items or when pipeline dries up
+                if accumulatedBatch.count >= 200 || (streamExhausted && inFlight == 0) {
+                    let updatedOverview = LibraryStorageOverview(
+                        totalBytes: runningPhotosBytes + runningLPStillBytes + runningLPVideoBytes + runningVideosBytes,
+                        totalCount: totalCount,
+                        photosBytes: runningPhotosBytes,
+                        photosCount: regularPhotoCount,
+                        livePhotosTotalBytes: runningLPStillBytes + runningLPVideoBytes,
+                        livePhotosStillBytes: runningLPStillBytes,
+                        livePhotosVideoBytes: runningLPVideoBytes,
+                        livePhotosCount: lpCount,
+                        videosBytes: runningVideosBytes,
+                        videosCount: videoCount,
+                        otherBytes: 0,
+                        otherCount: 0,
+                        isEstimated: false
+                    )
+                    
+                    let dispatchBatch = accumulatedBatch
+                    
+                    await MainActor.run {
+                        self.sizeRecords.merge(dispatchBatch) { _, new in new }
+                        self.storageOverview = updatedOverview
+                    }
+                    accumulatedBatch.removeAll(keepingCapacity: true)
+                }
+                
+                // Keep the pipe full
+                while inFlight < maxConcurrent, !streamExhausted {
+                    await spawnNext()
+                }
+                
+                await Task.yield()
+            }
+        }
+        
+        await MainActor.run {
+            self.sizeScanProgress = .idle
         }
         
         // Final background refresh of size-dependent collections once all sizes are resolved
@@ -421,7 +542,42 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    private func runAICategoryScanner(
+    /// Builds the Blurry Photos smart album from blur flags persisted during the hashing pass.
+    nonisolated private func buildBlurryPhotosAlbum(
+        photos: [PHAsset],
+        sizeIndex: [String: AssetSizeRecord],
+        cache: PhotoManagerCache
+    ) async {
+        let blurryIDs = await cache.getBlurryPhotoIDs()
+        guard !blurryIDs.isEmpty else {
+            await MainActor.run { self.blurryPhotosAlbum = nil }
+            return
+        }
+        
+        // Preserve library order and drop stale IDs for assets no longer in the library.
+        let orderedIDs = photos.compactMap { blurryIDs.contains($0.localIdentifier) ? $0.localIdentifier : nil }
+        guard !orderedIDs.isEmpty else {
+            await MainActor.run { self.blurryPhotosAlbum = nil }
+            return
+        }
+        
+        let totalBytes = orderedIDs.reduce(Int64(0)) { $0 + (sizeIndex[$1]?.totalBytes ?? 0) }
+        let album = SmartAlbumItem(
+            id: "blurry_photos",
+            title: "Blurry Photos",
+            count: orderedIDs.count,
+            totalBytes: totalBytes,
+            sfSymbol: "drop.triangle",
+            accentColorName: "teal",
+            assetIDs: orderedIDs,
+            newestAssetID: orderedIDs.first
+        )
+        await MainActor.run {
+            self.blurryPhotosAlbum = album
+        }
+    }
+    
+    nonisolated private func runAICategoryScanner(
         photos: [PHAsset],
         initialCache: [String: String],
         cache: PhotoManagerCache
@@ -475,6 +631,14 @@ public final class PhotoManagerCoordinator {
             self.photoSimilars = cleanGroups(self.photoSimilars, deleted: deletedSet)
             self.videoDuplicates = cleanGroups(self.videoDuplicates, deleted: deletedSet)
             self.videoSimilars = cleanGroups(self.videoSimilars, deleted: deletedSet)
+            
+            // Prune deleted assets from the blur album
+            if var blur = self.blurryPhotosAlbum {
+                blur.assetIDs.removeAll { deletedSet.contains($0) }
+                blur.count = blur.assetIDs.count
+                blur.totalBytes = blur.assetIDs.reduce(Int64(0)) { $0 + (self.sizeRecords[$1]?.totalBytes ?? 0) }
+                self.blurryPhotosAlbum = blur.assetIDs.isEmpty ? nil : blur
+            }
             
             // Recalculate smart albums & overview in background
             let sizes = self.sizeRecords

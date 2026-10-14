@@ -30,6 +30,9 @@ public struct PhotoManagerDashboardView: View {
                     // 1. Top Storage Overview Card (Targeted: observes storageOverview only)
                     StorageHeaderCardSection(coordinator: coordinator)
                     
+                    // 1b. Phase 0 Size Index Progress (Targeted: observes sizeScanProgress & sizeScanResolvedBytes only)
+                    SizeScanProgressSection(coordinator: coordinator)
+                    
                     // 2. Segmented Picker: [Photos | Videos]
                     Picker("Category", selection: $coordinator.selectedSegment) {
                         Text("Photos").tag(0)
@@ -114,7 +117,7 @@ public struct PhotoManagerDashboardView: View {
                 activeAlbumDetail = album
             }
             
-            // Cleanup Suggestions (Targeted: observes largePhotosAlbum & oldPhotosAlbum only)
+            // Cleanup Suggestions (Targeted: observes largePhotosAlbum, oldPhotosAlbum & blurryPhotosAlbum only)
             PhotoCleanupSuggestionsSection(coordinator: coordinator) { album in
                 activeAlbumDetail = album
             }
@@ -159,6 +162,20 @@ private struct StorageHeaderCardSection: View {
     
     var body: some View {
         StorageHeaderCardView(overview: coordinator.storageOverview)
+    }
+}
+
+/// Target 1b: Size scan card re-evaluates ONLY when sizeScanProgress or sizeScanResolvedBytes changes.
+private struct SizeScanProgressSection: View {
+    var coordinator: PhotoManagerCoordinator
+    
+    var body: some View {
+        if coordinator.sizeScanProgress.isScanning {
+            SizeScanProgressCardView(
+                progress: coordinator.sizeScanProgress,
+                resolvedBytes: coordinator.sizeScanResolvedBytes
+            )
+        }
     }
 }
 
@@ -218,15 +235,16 @@ private struct PhotoSmartAlbumsSection: View {
     }
 }
 
-/// Target 4: Cleanup suggestions re-evaluate ONLY when largePhotosAlbum or oldPhotosAlbum changes.
+/// Target 4: Cleanup suggestions re-evaluate ONLY when largePhotosAlbum, oldPhotosAlbum, or blurryPhotosAlbum changes.
 private struct PhotoCleanupSuggestionsSection: View {
     var coordinator: PhotoManagerCoordinator
     let onSelectAlbum: (SmartAlbumItem) -> Void
     
     var body: some View {
-        if coordinator.largePhotosAlbum != nil || coordinator.oldPhotosAlbum != nil {
+        if coordinator.largePhotosAlbum != nil || coordinator.oldPhotosAlbum != nil || coordinator.blurryPhotosAlbum != nil {
             VStack(spacing: 8) {
-                sectionHeader(title: "Cleanup Suggestions", count: 2)
+                let itemCount = [coordinator.largePhotosAlbum, coordinator.oldPhotosAlbum, coordinator.blurryPhotosAlbum].compactMap { $0 }.count
+                sectionHeader(title: "Cleanup Suggestions", count: itemCount)
                 if let large = coordinator.largePhotosAlbum {
                     SmartAlbumCardView(item: large) {
                         onSelectAlbum(large)
@@ -235,6 +253,11 @@ private struct PhotoCleanupSuggestionsSection: View {
                 if let old = coordinator.oldPhotosAlbum {
                     SmartAlbumCardView(item: old) {
                         onSelectAlbum(old)
+                    }
+                }
+                if let blurry = coordinator.blurryPhotosAlbum {
+                    SmartAlbumCardView(item: blurry) {
+                        onSelectAlbum(blurry)
                     }
                 }
             }
