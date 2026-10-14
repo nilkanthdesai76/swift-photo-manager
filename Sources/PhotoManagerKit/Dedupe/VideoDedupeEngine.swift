@@ -245,12 +245,12 @@ public enum VideoDedupeEngine {
             if exactIndices.count > 1 {
                 for idx in exactIndices { visited[idx] = true }
                 let groupAssets = exactIndices.map { list[$0].asset }
-                let group = makeVideoGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
+                let group = await makeVideoGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
                 duplicates.append(group)
             } else if similarIndices.count > 1 {
                 for idx in similarIndices { visited[idx] = true }
                 let groupAssets = similarIndices.map { list[$0].asset }
-                let group = makeVideoGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
+                let group = await makeVideoGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
                 similars.append(group)
             }
             
@@ -258,10 +258,11 @@ public enum VideoDedupeEngine {
                 await Task.yield()
             }
             
-            if i % 250 == 0 {
+            // Emit a real fraction during grouping so the ring moves instead of sitting at 100%.
+            if i % 250 == 0, sorted.count > 0 {
                 progressHandler?(
                     ScanProgress(
-                        processed: list.count,
+                        processed: Int((Double(i) / Double(sorted.count)) * Double(list.count)),
                         total: list.count,
                         isScanning: true
                     )
@@ -276,7 +277,7 @@ public enum VideoDedupeEngine {
         from videos: [PHAsset],
         kind: DedupeMatchKind,
         sizeRecords: [String: AssetSizeRecord]
-    ) -> DedupeGroup {
+    ) async -> DedupeGroup {
         let sortedByQuality = videos.sorted { a, b in
             if a.isFavorite != b.isFavorite { return a.isFavorite }
             let resA = a.pixelWidth * a.pixelHeight
@@ -285,24 +286,34 @@ public enum VideoDedupeEngine {
         }
         let bestID = sortedByQuality.first?.localIdentifier ?? videos[0].localIdentifier
         
-        let items: [DedupeAssetItem] = videos.map { asset in
-            let record = sizeRecords[asset.localIdentifier] ?? StorageCalculator.resolveExactSize(for: asset)
+        var items: [DedupeAssetItem] = []
+        items.reserveCapacity(videos.count)
+        for asset in videos {
+            // Non-blocking: missing sizes resolve on GCD workers and never stall clustering.
+            let record: AssetSizeRecord
+            if let cached = sizeRecords[asset.localIdentifier] {
+                record = cached
+            } else {
+                record = await StorageCalculator.resolveExactSizeAsync(for: asset)
+            }
             let total = record.totalBytes
             let isBest = asset.localIdentifier == bestID
             
-            return DedupeAssetItem(
-                id: asset.localIdentifier,
-                creationDate: asset.creationDate,
-                pixelWidth: asset.pixelWidth,
-                pixelHeight: asset.pixelHeight,
-                duration: asset.duration,
-                totalBytes: total,
-                stillBytes: 0,
-                videoBytes: total,
-                isLivePhoto: false,
-                isVideo: true,
-                isFavorite: asset.isFavorite,
-                isSelectedForDeletion: !isBest
+            items.append(
+                DedupeAssetItem(
+                    id: asset.localIdentifier,
+                    creationDate: asset.creationDate,
+                    pixelWidth: asset.pixelWidth,
+                    pixelHeight: asset.pixelHeight,
+                    duration: asset.duration,
+                    totalBytes: total,
+                    stillBytes: 0,
+                    videoBytes: total,
+                    isLivePhoto: false,
+                    isVideo: true,
+                    isFavorite: asset.isFavorite,
+                    isSelectedForDeletion: !isBest
+                )
             )
         }
         

@@ -343,7 +343,7 @@ public enum PhotoDedupeEngine {
                     if currentGroup.count > 1 {
                         for cIdx in currentGroup { visited[cIdx] = true }
                         let groupAssets = currentGroup.map { list[compactItems[$0].originalIndex].asset }
-                        let group = makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
+                        let group = await makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
                         duplicates.append(group)
                     }
                     currentGroup = [candidateIdx]
@@ -354,7 +354,7 @@ public enum PhotoDedupeEngine {
             if currentGroup.count > 1 {
                 for cIdx in currentGroup { visited[cIdx] = true }
                 let groupAssets = currentGroup.map { list[compactItems[$0].originalIndex].asset }
-                let group = makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
+                let group = await makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
                 duplicates.append(group)
             }
         }
@@ -399,7 +399,7 @@ public enum PhotoDedupeEngine {
                     visited[origIdx] = true
                 }
                 let groupAssets = clusterCompactIndices.map { list[$0].asset }
-                let group = makeGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
+                let group = await makeGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
                 similars.append(group)
             }
             
@@ -407,10 +407,11 @@ public enum PhotoDedupeEngine {
                 await Task.yield()
             }
             
+            // Emit a real fraction during grouping so the ring moves instead of sitting at 100%.
             if i % 500 == 0, clusterTotal > 0 {
                 progressHandler?(
                     ScanProgress(
-                        processed: list.count,
+                        processed: Int((Double(i) / Double(clusterTotal)) * Double(list.count)),
                         total: list.count,
                         isScanning: true
                     )
@@ -425,7 +426,7 @@ public enum PhotoDedupeEngine {
         from assets: [PHAsset],
         kind: DedupeMatchKind,
         sizeRecords: [String: AssetSizeRecord]
-    ) -> DedupeGroup {
+    ) async -> DedupeGroup {
         // Determine "Best" asset (favorites first, then largest pixel resolution)
         let sortedByQuality = assets.sorted { a, b in
             if a.isFavorite != b.isFavorite { return a.isFavorite }
@@ -435,26 +436,34 @@ public enum PhotoDedupeEngine {
         }
         let bestID = sortedByQuality.first?.localIdentifier ?? assets[0].localIdentifier
         
-        let items: [DedupeAssetItem] = assets.map { asset in
-            let record = sizeRecords[asset.localIdentifier] ?? StorageCalculator.resolveExactSize(for: asset)
-            let total = record.totalBytes
-            let still = record.stillBytes
-            let video = record.videoBytes
+        var items: [DedupeAssetItem] = []
+        items.reserveCapacity(assets.count)
+        for asset in assets {
+            // Non-blocking: missing sizes resolve on GCD workers and never stall clustering
+            // or fight the size-fetch trickle on an executor thread.
+            let record: AssetSizeRecord
+            if let cached = sizeRecords[asset.localIdentifier] {
+                record = cached
+            } else {
+                record = await StorageCalculator.resolveExactSizeAsync(for: asset)
+            }
             let isBest = asset.localIdentifier == bestID
             
-            return DedupeAssetItem(
-                id: asset.localIdentifier,
-                creationDate: asset.creationDate,
-                pixelWidth: asset.pixelWidth,
-                pixelHeight: asset.pixelHeight,
-                duration: asset.duration,
-                totalBytes: total,
-                stillBytes: still,
-                videoBytes: video,
-                isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
-                isVideo: false,
-                isFavorite: asset.isFavorite,
-                isSelectedForDeletion: !isBest // Auto-select redundant copies for deletion
+            items.append(
+                DedupeAssetItem(
+                    id: asset.localIdentifier,
+                    creationDate: asset.creationDate,
+                    pixelWidth: asset.pixelWidth,
+                    pixelHeight: asset.pixelHeight,
+                    duration: asset.duration,
+                    totalBytes: record.totalBytes,
+                    stillBytes: record.stillBytes,
+                    videoBytes: record.videoBytes,
+                    isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
+                    isVideo: false,
+                    isFavorite: asset.isFavorite,
+                    isSelectedForDeletion: !isBest // Auto-select redundant copies for deletion
+                )
             )
         }
         
