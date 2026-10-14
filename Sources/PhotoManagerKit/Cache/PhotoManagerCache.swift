@@ -312,6 +312,19 @@ public actor PhotoManagerCache {
         scheduleDebouncedSave()
     }
     
+    /// Clears only the clustered groups + scan-complete flags, keeping hashes/fingerprints.
+    /// Used by "Re-group only" — the re-scan then skips hashing and re-runs just the clustering.
+    public func clearGroups() {
+        photoDuplicates.removeAll()
+        photoSimilars.removeAll()
+        videoDuplicates.removeAll()
+        videoSimilars.removeAll()
+        photoScanCompleted = false
+        videoScanCompleted = false
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
     /// Snapshot of current cache contents for the process dashboard.
     public func stats() -> (
         sizes: Int,

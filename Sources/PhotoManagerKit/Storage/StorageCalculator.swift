@@ -152,11 +152,13 @@ public enum StorageCalculator {
     
     /// Resolves sizes for all assets missing from `existing`, concurrently on GCD workers.
     /// Returns `existing` merged with the newly resolved records.
+    /// `progressHandler` reports (resolvedCount, totalMissing) as chunks complete.
     public static func resolveMissingSizes(
         for assets: [PHAsset],
         existing: [String: AssetSizeRecord],
-        maxConcurrent: Int = 8,
-        qos: DispatchQoS.QoSClass = .utility
+        maxConcurrent: Int = 16,
+        qos: DispatchQoS.QoSClass = .utility,
+        progressHandler: (@Sendable (Int, Int) -> Void)? = nil
     ) async -> [String: AssetSizeRecord] {
         var unique: [String: PHAsset] = [:]
         unique.reserveCapacity(assets.count)
@@ -174,6 +176,8 @@ public enum StorageCalculator {
         let chunks: [[PHAsset]] = stride(from: 0, to: missing.count, by: chunkSize).map {
             Array(missing[$0..<min($0 + chunkSize, missing.count)])
         }
+        let missingTotal = missing.count
+        var resolvedCount = 0
         
         await withTaskGroup(of: [String: AssetSizeRecord].self) { group in
             for chunk in chunks {
@@ -189,6 +193,8 @@ public enum StorageCalculator {
             }
             for await batch in group {
                 result.merge(batch) { _, new in new }
+                resolvedCount += batch.count
+                progressHandler?(min(resolvedCount, missingTotal), missingTotal)
             }
         }
         

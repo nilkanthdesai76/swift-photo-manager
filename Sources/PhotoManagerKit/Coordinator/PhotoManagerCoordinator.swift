@@ -79,6 +79,20 @@ public final class PhotoManagerCoordinator {
     public var sizeScanProgress: ScanProgress = .idle
     public var sizeScanResolvedBytes: Int64 = 0
     
+    // MARK: - Similarity Settings (Process Dashboard)
+    /// Clustering strictness; persisted across launches, used by every photo/video scan.
+    public var similarityPreset: SimilarityPreset = SimilarityPreset(
+        rawValue: UserDefaults.standard.string(forKey: "pmk.similarityPreset") ?? ""
+    ) ?? .balanced {
+        didSet {
+            UserDefaults.standard.set(similarityPreset.rawValue, forKey: "pmk.similarityPreset")
+        }
+    }
+    
+    // MARK: - Running Process Registry (for cancellation from the process dashboard)
+    @ObservationIgnored
+    private var processTasks: [String: Task<Void, Never>] = [:]
+    
     @ObservationIgnored
     private let cache: PhotoManagerCache
     @ObservationIgnored
@@ -349,15 +363,19 @@ public final class PhotoManagerCoordinator {
         cache: PhotoManagerCache
     ) async -> DedupeScanResult {
         let sizes = await MainActor.run { self.sizeRecords }
+        let preset = await MainActor.run { self.similarityPreset }
         return await PhotoDedupeEngine.scanPhotoDedupe(
             assets: assets,
             cache: cache,
             sizeRecords: sizes,
+            preset: preset,
             progressHandler: { [weak self] p in
                 Task { @MainActor in
                     self?.photoDedupeProgress = p
                     if p.isScanning {
-                        self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
+                        self?.statusMessage = p.label == "Resolving sizes"
+                            ? "Resolving group sizes (\(p.processed)/\(p.total))…"
+                            : "\(p.label ?? "Scanning") photos (\(p.processed)/\(p.total))…"
                     }
                 }
             }
@@ -370,15 +388,19 @@ public final class PhotoManagerCoordinator {
         cache: PhotoManagerCache
     ) async -> DedupeScanResult {
         let sizes = await MainActor.run { self.sizeRecords }
+        let preset = await MainActor.run { self.similarityPreset }
         return await VideoDedupeEngine.scanVideoDedupe(
             videos: videos,
             cache: cache,
             sizeRecords: sizes,
+            preset: preset,
             progressHandler: { [weak self] p in
                 Task { @MainActor in
                     self?.videoDedupeProgress = p
                     if p.isScanning {
-                        self?.statusMessage = "Scanning videos (\(p.processed)/\(p.total))…"
+                        self?.statusMessage = p.label == "Resolving sizes"
+                            ? "Resolving group sizes (\(p.processed)/\(p.total))…"
+                            : "\(p.label ?? "Scanning") videos (\(p.processed)/\(p.total))…"
                     }
                 }
             }
@@ -646,6 +668,25 @@ public final class PhotoManagerCoordinator {
     
     // MARK: - Process Dashboard Actions
     
+    /// True while a dashboard-triggered process is running under the given key.
+    public func isProcessRunning(_ key: String) -> Bool {
+        processTasks[key] != nil
+    }
+    
+    /// Cancels a running dashboard-triggered process (hashing/grouping loops check Task.isCancelled).
+    public func cancelProcess(_ key: String) {
+        processTasks[key]?.cancel()
+        processTasks[key] = nil
+    }
+    
+    private func register(_ key: String, _ task: Task<Void, Never>) {
+        processTasks[key] = task
+    }
+    
+    private func unregister(_ key: String) {
+        processTasks[key] = nil
+    }
+    
     /// Clears every cache (this session and all previous sessions) and resets published state.
     public func clearAllCaches() async {
         await cache.clear()
@@ -675,46 +716,95 @@ public final class PhotoManagerCoordinator {
     }
     
     /// Re-runs photo hashing + duplicate/similar clustering from scratch (clears photo hash & blur caches).
-    public func rerunPhotoDedupe() async {
-        guard !allPhotos.isEmpty else { return }
+    /// Runs as a cancellable background process (key "photo").
+    public func rerunPhotoDedupe() {
+        guard processTasks["photo"] == nil, !allPhotos.isEmpty else { return }
         let photos = self.allPhotos
         let cacheRef = self.cache
-        await cacheRef.clearPhotoHashesAndBlur()
-        photoDedupeProgress = ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Hashing")
-        blurryPhotosAlbum = nil
-        let result = await Task.detached(priority: .userInitiated) {
-            await self.runPhotoScan(assets: photos, cache: cacheRef)
-        }.value
-        photoDuplicates = result.duplicates
-        photoSimilars = result.similars
-        photoDedupeProgress = .done
-        await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: self.sizeRecords, cache: cacheRef)
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            await cacheRef.clearPhotoHashesAndBlur()
+            await MainActor.run {
+                self.photoDedupeProgress = ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Hashing")
+                self.blurryPhotosAlbum = nil
+            }
+            let result = await self.runPhotoScan(assets: photos, cache: cacheRef)
+            await MainActor.run {
+                self.photoDuplicates = result.duplicates
+                self.photoSimilars = result.similars
+                self.photoDedupeProgress = .done
+            }
+            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: self.sizeRecords, cache: cacheRef)
+            await MainActor.run { self.unregister("photo") }
+        }
+        register("photo", task)
     }
     
     /// Re-runs video fingerprinting + duplicate/similar clustering from scratch.
-    public func rerunVideoDedupe() async {
-        guard !allVideos.isEmpty else { return }
+    /// Runs as a cancellable background process (key "video").
+    public func rerunVideoDedupe() {
+        guard processTasks["video"] == nil, !allVideos.isEmpty else { return }
         let videos = self.allVideos
         let cacheRef = self.cache
-        await cacheRef.clearVideoFingerprints()
-        videoDedupeProgress = ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Hashing")
-        let result = await Task.detached(priority: .userInitiated) {
-            await self.runVideoScan(videos: videos, cache: cacheRef)
-        }.value
-        videoDuplicates = result.duplicates
-        videoSimilars = result.similars
-        videoDedupeProgress = .done
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            await cacheRef.clearVideoFingerprints()
+            await MainActor.run {
+                self.videoDedupeProgress = ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Hashing")
+            }
+            let result = await self.runVideoScan(videos: videos, cache: cacheRef)
+            await MainActor.run {
+                self.videoDuplicates = result.duplicates
+                self.videoSimilars = result.similars
+                self.videoDedupeProgress = .done
+            }
+            await MainActor.run { self.unregister("video") }
+        }
+        register("video", task)
     }
     
-    /// Re-runs the exact size fetch for all assets (clears the size index first).
-    public func rerunSizeFetch() async {
-        guard !allPhotos.isEmpty || !allVideos.isEmpty else { return }
+    /// Re-groups duplicates for BOTH photos and videos while KEEPING hashes/fingerprints,
+    /// so only the (comparatively fast) clustering phase re-runs.
+    /// Runs as a cancellable background process (key "regroup").
+    public func regroupDuplicates() {
+        guard processTasks["regroup"] == nil, !allPhotos.isEmpty || !allVideos.isEmpty else { return }
         let photos = self.allPhotos
         let videos = self.allVideos
         let cacheRef = self.cache
-        await cacheRef.clearSizes()
-        sizeScanResolvedBytes = 0
-        await Task.detached(priority: .utility) {
+        let task = Task.detached(priority: .userInitiated) { [weak self] in
+            guard let self = self else { return }
+            await cacheRef.clearGroups()
+            await MainActor.run {
+                self.photoDedupeProgress = ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Grouping")
+                self.videoDedupeProgress = ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Grouping")
+            }
+            async let photoResult = self.runPhotoScan(assets: photos, cache: cacheRef)
+            async let videoResult = self.runVideoScan(videos: videos, cache: cacheRef)
+            let (p, v) = await (photoResult, videoResult)
+            await MainActor.run {
+                self.photoDuplicates = p.duplicates
+                self.photoSimilars = p.similars
+                self.photoDedupeProgress = .done
+                self.videoDuplicates = v.duplicates
+                self.videoSimilars = v.similars
+                self.videoDedupeProgress = .done
+            }
+            await MainActor.run { self.unregister("regroup") }
+        }
+        register("regroup", task)
+    }
+    
+    /// Re-runs the exact size fetch for all assets (clears the size index first).
+    /// Runs as a cancellable background process (key "sizes").
+    public func rerunSizeFetch() {
+        guard processTasks["sizes"] == nil, !allPhotos.isEmpty || !allVideos.isEmpty else { return }
+        let photos = self.allPhotos
+        let videos = self.allVideos
+        let cacheRef = self.cache
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            await cacheRef.clearSizes()
+            await MainActor.run { self.sizeScanResolvedBytes = 0 }
             await self.runKvcSizeResolver(
                 photos: photos,
                 videos: videos,
@@ -723,21 +813,27 @@ public final class PhotoManagerCoordinator {
                 maxConcurrent: max(8, min(16, ProcessInfo.processInfo.processorCount)),
                 qos: .utility
             )
-        }.value
-        let sizes = await cacheRef.getAllSizes()
-        self.sizeRecords = sizes
-        await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizes, cache: cacheRef)
+            let sizes = await cacheRef.getAllSizes()
+            await MainActor.run { self.sizeRecords = sizes }
+            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizes, cache: cacheRef)
+            await MainActor.run { self.unregister("sizes") }
+        }
+        register("sizes", task)
     }
     
     /// Re-runs AI categorization from scratch (clears AI category cache first).
-    public func rerunAICategories() async {
-        guard !allPhotos.isEmpty else { return }
+    /// Runs as a cancellable background process (key "ai").
+    public func rerunAICategories() {
+        guard processTasks["ai"] == nil, !allPhotos.isEmpty else { return }
         let photos = self.allPhotos
         let cacheRef = self.cache
-        await cacheRef.clearAICategories()
-        await Task.detached(priority: .utility) {
+        let task = Task.detached(priority: .utility) { [weak self] in
+            guard let self = self else { return }
+            await cacheRef.clearAICategories()
             await self.runAICategoryScanner(photos: photos, initialCache: [:], cache: cacheRef)
-        }.value
+            await MainActor.run { self.unregister("ai") }
+        }
+        register("ai", task)
     }
     
     // MARK: - Deletion Action

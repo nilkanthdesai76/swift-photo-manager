@@ -1,9 +1,10 @@
 import SwiftUI
 
 /// Process control dashboard: shows cache contents and provides controls to clear caches
-/// (current + previous sessions) and re-run individual pipeline processes on demand.
+/// (current + previous sessions), tune similarity strictness, re-run individual pipeline
+/// processes, re-group without re-hashing, and cancel running processes.
 public struct ProcessDashboardView: View {
-    public let coordinator: PhotoManagerCoordinator
+    @Bindable public var coordinator: PhotoManagerCoordinator
     
     @State private var stats: (
         sizes: Int,
@@ -46,6 +47,28 @@ public struct ProcessDashboardView: View {
                         .cornerRadius(12)
                     }
                     
+                    // MARK: Similarity Settings
+                    VStack(alignment: .leading, spacing: 10) {
+                        sectionHeader("Similarity Strictness")
+                        
+                        VStack(spacing: 8) {
+                            Picker("Similarity", selection: $coordinator.similarityPreset) {
+                                ForEach(SimilarityPreset.allCases) { preset in
+                                    Text(preset.rawValue).tag(preset)
+                                }
+                            }
+                            .pickerStyle(.segmented)
+                            
+                            Text(strictnessDescription(coordinator.similarityPreset))
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                        }
+                        .padding(12)
+                        .background(Color.platformSecondaryBackground)
+                        .cornerRadius(12)
+                    }
+                    
                     // MARK: Re-run Processes
                     VStack(alignment: .leading, spacing: 10) {
                         sectionHeader("Re-run Process")
@@ -58,7 +81,7 @@ public struct ProcessDashboardView: View {
                                 subtitle: "Clears photo hash + blur caches, re-scans",
                                 taskKey: "photo"
                             ) {
-                                await coordinator.rerunPhotoDedupe()
+                                coordinator.rerunPhotoDedupe()
                             }
                             Divider().padding(.leading, 54)
                             actionRow(
@@ -68,7 +91,17 @@ public struct ProcessDashboardView: View {
                                 subtitle: "Clears video fingerprints, re-scans",
                                 taskKey: "video"
                             ) {
-                                await coordinator.rerunVideoDedupe()
+                                coordinator.rerunVideoDedupe()
+                            }
+                            Divider().padding(.leading, 54)
+                            actionRow(
+                                icon: "arrow.triangle.merge",
+                                color: .green,
+                                title: "Re-group Only (keeps hashes)",
+                                subtitle: "Fast: skips hashing, re-clusters both photos & videos",
+                                taskKey: "regroup"
+                            ) {
+                                coordinator.regroupDuplicates()
                             }
                             Divider().padding(.leading, 54)
                             actionRow(
@@ -78,7 +111,7 @@ public struct ProcessDashboardView: View {
                                 subtitle: "Clears size index, re-resolves all sizes",
                                 taskKey: "sizes"
                             ) {
-                                await coordinator.rerunSizeFetch()
+                                coordinator.rerunSizeFetch()
                             }
                             Divider().padding(.leading, 54)
                             actionRow(
@@ -88,11 +121,34 @@ public struct ProcessDashboardView: View {
                                 subtitle: "Clears AI cache, re-classifies photos",
                                 taskKey: "ai"
                             ) {
-                                await coordinator.rerunAICategories()
+                                coordinator.rerunAICategories()
                             }
                         }
                         .background(Color.platformSecondaryBackground)
                         .cornerRadius(12)
+                        
+                        if runningTask != nil {
+                            Button {
+                                if let key = runningTask {
+                                    coordinator.cancelProcess(key)
+                                    runningTask = nil
+                                    flash("Process cancelled")
+                                }
+                            } label: {
+                                HStack {
+                                    Image(systemName: "xmark.octagon.fill")
+                                    Text("Cancel Running Process")
+                                }
+                                .font(.subheadline)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.red)
+                                .frame(maxWidth: .infinity)
+                                .padding(10)
+                                .background(Color.red.opacity(0.1))
+                                .cornerRadius(10)
+                            }
+                            .buttonStyle(.plain)
+                        }
                     }
                     
                     // MARK: Danger Zone
@@ -149,6 +205,9 @@ public struct ProcessDashboardView: View {
             .refreshable {
                 await refreshStats()
             }
+            .onChange(of: coordinator.similarityPreset) { _ in
+                flash("Strictness updated — applies to the next scan")
+            }
             .alert("Clear All Caches?", isPresented: $showClearAllConfirmation) {
                 Button("Cancel", role: .cancel) {}
                 Button("Clear Everything", role: .destructive) {
@@ -161,6 +220,18 @@ public struct ProcessDashboardView: View {
             } message: {
                 Text("This deletes size records, hashes, fingerprints, dedupe groups, blur flags, and AI categories from this device.")
             }
+        }
+    }
+    
+    private func strictnessDescription(_ preset: SimilarityPreset) -> String {
+        let hours = String(format: "%.0f", preset.timeWindow / 3600)
+        switch preset {
+        case .strict:
+            return "Fewer, more accurate matches (max \(preset.hammingThreshold) hash bits, \(hours)h window)."
+        case .balanced:
+            return "Default matching (max \(preset.hammingThreshold) hash bits, \(hours)h window)."
+        case .relaxed:
+            return "More matches, including loosely similar shots (max \(preset.hammingThreshold) hash bits, \(hours)h window)."
         }
     }
     
@@ -194,16 +265,22 @@ public struct ProcessDashboardView: View {
         title: String,
         subtitle: String,
         taskKey: String,
-        action: @escaping () async -> Void
+        action: @escaping () -> Void
     ) -> some View {
         Button {
             guard runningTask == nil else { return }
             runningTask = taskKey
+            action()
+            // The coordinator unregisters the task when done; poll briefly to clear the spinner.
             Task {
-                await action()
-                runningTask = nil
-                await refreshStats()
-                flash("\(title) complete")
+                while coordinator.isProcessRunning(taskKey) {
+                    try? await Task.sleep(nanoseconds: 500_000_000)
+                }
+                if runningTask == taskKey {
+                    runningTask = nil
+                    await refreshStats()
+                    flash("\(title) complete")
+                }
             }
         } label: {
             HStack(spacing: 12) {

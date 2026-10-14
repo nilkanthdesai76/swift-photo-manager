@@ -220,9 +220,44 @@ public struct ScanProgress: Equatable, Sendable, Codable {
     }
 }
 
+/// Similarity strictness for duplicate/similar clustering, user-selectable from the process dashboard.
+public enum SimilarityPreset: String, CaseIterable, Identifiable, Sendable {
+    case strict = "Strict"
+    case balanced = "Balanced"
+    case relaxed = "Relaxed"
+    
+    public var id: String { rawValue }
+    
+    /// Max Hamming distance between hashes to count as "similar".
+    public var hammingThreshold: Int {
+        switch self {
+        case .strict: return 5
+        case .balanced: return 8
+        case .relaxed: return 12
+        }
+    }
+    
+    /// How many chronological neighbours each anchor compares against.
+    public var maxLookahead: Int {
+        switch self {
+        case .strict: return 100
+        case .balanced: return 150
+        case .relaxed: return 200
+        }
+    }
+    
+    /// Temporal window for grouping similar captures.
+    public var timeWindow: TimeInterval {
+        switch self {
+        case .strict: return 3600 // 1 hour
+        case .balanced: return 7200 // 2 hours
+        case .relaxed: return 14400 // 4 hours
+        }
+    }
+}
+
 /// Standardized byte string formatter.
-public enum ByteFormatter {
-    private static let formatter: ByteCountFormatter = {
+public enum ByteFormatter {    private static let formatter: ByteCountFormatter = {
         let b = ByteCountFormatter()
         b.allowedUnits = [.useBytes, .useKB, .useMB, .useGB]
         b.countStyle = .file

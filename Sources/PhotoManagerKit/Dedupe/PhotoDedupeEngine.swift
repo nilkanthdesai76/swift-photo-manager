@@ -20,6 +20,7 @@ public enum PhotoDedupeEngine {
         assets: [PHAsset],
         cache: PhotoManagerCache = .shared,
         sizeRecords: [String: AssetSizeRecord] = [:],
+        preset: SimilarityPreset = .balanced,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         guard !assets.isEmpty else {
@@ -49,7 +50,12 @@ public enum PhotoDedupeEngine {
                 label: "Grouping"
             )
         )
-        let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords, progressHandler: progressHandler)
+        let clustered = await clusterAssets(
+            assetHashes,
+            sizeRecords: sizeRecords,
+            preset: preset,
+            progressHandler: progressHandler
+        )
         await cache.putPhotoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
         progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
         return clustered
@@ -287,6 +293,7 @@ public enum PhotoDedupeEngine {
     private static func clusterAssets(
         _ list: [(asset: PHAsset, hash: UInt64)],
         sizeRecords: [String: AssetSizeRecord],
+        preset: SimilarityPreset = .balanced,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         let totalCount = list.count
@@ -377,8 +384,9 @@ public enum PhotoDedupeEngine {
         let unvisitedItems = compactItems.filter { !visited[$0.originalIndex] }
             .sorted { $0.timestamp < $1.timestamp }
         
-        let similarTimeWindow: TimeInterval = 7200 // 2-hour temporal gating for burst/similar shots
-        let maxLookahead = 150 // Memory-safe lookahead bound per anchor
+        let similarTimeWindow: TimeInterval = preset.timeWindow
+        let maxLookahead = preset.maxLookahead
+        let hammingThreshold = preset.hammingThreshold
         let clusterTotal = unvisitedItems.count
         
         for i in 0..<clusterTotal {
@@ -400,7 +408,7 @@ public enum PhotoDedupeEngine {
                 
                 // Hardware-accelerated bitwise distance (single CPU instruction)
                 let dist = (current.hash ^ candidate.hash).nonzeroBitCount
-                if dist <= 8 {
+                if dist <= hammingThreshold {
                     clusterCompactIndices.append(candidate.originalIndex)
                 }
             }
@@ -423,11 +431,17 @@ public enum PhotoDedupeEngine {
         }
         
         // Resolve sizes for ALL group members concurrently — never block the cluster loops above.
+        // This is the expensive tail of grouping, so it reports its own visible progress.
         let groupedAssets = (rawExactGroups + rawSimilarGroups).flatMap { $0 }
         let resolvedSizes = await StorageCalculator.resolveMissingSizes(
             for: groupedAssets,
             existing: sizeRecords,
-            maxConcurrent: 8
+            maxConcurrent: 16,
+            progressHandler: { resolved, total in
+                progressHandler?(
+                    ScanProgress(processed: resolved, total: total, isScanning: true, label: "Resolving sizes")
+                )
+            }
         )
         
         let duplicates = rawExactGroups.map { makeGroup(from: $0, kind: .exactDuplicate, sizeRecords: resolvedSizes) }

@@ -124,7 +124,7 @@ public struct DedupeProgressCardView: View {
                         ProgressView(value: progress.fraction)
                             .tint(accentColor)
                         HStack {
-                            Text(progress.label.map { "\($0) library assets…" } ?? "Hashing library assets…")
+                            Text(progress.label.map { "\($0)…" } ?? "Hashing library assets…")
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary)
                             Spacer()

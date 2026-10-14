@@ -20,6 +20,7 @@ public enum VideoDedupeEngine {
         videos: [PHAsset],
         cache: PhotoManagerCache = .shared,
         sizeRecords: [String: AssetSizeRecord] = [:],
+        preset: SimilarityPreset = .balanced,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         guard !videos.isEmpty else {
@@ -48,7 +49,12 @@ public enum VideoDedupeEngine {
                 label: "Grouping"
             )
         )
-        let clustered = await clusterVideos(videoRecords, sizeRecords: sizeRecords, progressHandler: progressHandler)
+        let clustered = await clusterVideos(
+            videoRecords,
+            sizeRecords: sizeRecords,
+            preset: preset,
+            progressHandler: progressHandler
+        )
         await cache.putVideoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
         progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
         return clustered
@@ -193,6 +199,7 @@ public enum VideoDedupeEngine {
     private static func clusterVideos(
         _ list: [(asset: PHAsset, fingerprint: VideoFingerprintRecord)],
         sizeRecords: [String: AssetSizeRecord],
+        preset: SimilarityPreset = .balanced,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         let totalCount = list.count
@@ -251,7 +258,7 @@ public enum VideoDedupeEngine {
                 
                 if durationDiff <= 0.2 && dist == 0 {
                     exactIndices.append(candidate.originalIndex)
-                } else if durationDiff <= 2.0 && dist <= 8 {
+                } else if durationDiff <= 2.0 && dist <= preset.hammingThreshold {
                     similarIndices.append(candidate.originalIndex)
                 }
             }
@@ -275,11 +282,17 @@ public enum VideoDedupeEngine {
         }
         
         // Resolve sizes for ALL group members concurrently — never block the cluster loop above.
+        // This is the expensive tail of grouping, so it reports its own visible progress.
         let groupedAssets = (rawExactGroups + rawSimilarGroups).flatMap { $0 }
         let resolvedSizes = await StorageCalculator.resolveMissingSizes(
             for: groupedAssets,
             existing: sizeRecords,
-            maxConcurrent: 8
+            maxConcurrent: 16,
+            progressHandler: { resolved, total in
+                progressHandler?(
+                    ScanProgress(processed: resolved, total: total, isScanning: true, label: "Resolving sizes")
+                )
+            }
         )
         
         let duplicates = rawExactGroups.map { makeVideoGroup(from: $0, kind: .exactDuplicate, sizeRecords: resolvedSizes) }
