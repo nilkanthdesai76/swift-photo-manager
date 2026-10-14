@@ -31,6 +31,9 @@ public enum PipelineStep: String, Sendable, Equatable {
     case completed = "Ready"
 }
 
+/// Result of a photo or video dedupe scan.
+public typealias DedupeScanResult = (duplicates: [DedupeGroup], similars: [DedupeGroup])
+
 /// Main orchestrator managing the library lifecycle, storage calculations, smart albums, and dedupe progress.
 /// Uses the Swift `@Observable` macro for fine-grained, targeted UI invalidation without halting user interaction.
 /// Pipelines execute strictly sequentially one-by-one: Sizes -> Photo Dedupe -> Video Dedupe -> AI Sorting.
@@ -213,18 +216,12 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    /// Starts the prioritized background pipeline.
+    /// Starts the fully independent background pipeline.
     ///
-    /// Strategy: hashing (photo + video) is the FIRST priority. Size fetching only trickles in the
-    /// leftover capacity (2 workers, background QoS) while hashing/clustering runs. Once both photo
-    /// and video grouping are done, the size fetch escalates to full worker count at utility QoS to
-    /// finish the remaining assets as fast as possible.
-    ///
-    /// Phase 1: Photo hashing (+ video fingerprinting + size trickle run concurrently).
-    /// Phase 2: Photo grouping as soon as photo hashing finishes.
-    /// Phase 3: Video grouping as soon as video fingerprinting finishes.
-    /// Phase 4: Full-speed size fetch for the remaining uncached assets.
-    /// Phase 5: Blur album + AI sorting.
+    /// Photo scan, video scan, and the size-fetch trickle are three fully independent detached tasks.
+    /// Nothing blocks on the size fetch: each dedupe task hashes AND clusters on its own, and groups
+    /// are published the moment each scan completes. The size fetch only trickles (2 workers,
+    /// background QoS) while the scans run, then escalates to full speed once both scans finish.
     private func startBackgroundPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
         let videos = self.allVideos
@@ -241,7 +238,7 @@ public final class PhotoManagerCoordinator {
             
             let initialSizes = await MainActor.run { self.sizeRecords }
             
-            // Size fetch TRICKLE: low priority + few workers so hashing gets the CPU first.
+            // Size fetch TRICKLE: fully independent, lowest priority, few workers.
             let sizeTrickleTask = Task.detached(priority: .background) {
                 await self.runKvcSizeResolver(
                     photos: photos,
@@ -253,92 +250,30 @@ public final class PhotoManagerCoordinator {
                 )
             }
             
-            // ==========================================
-            // PHASE 1: PHOTO HASH + VIDEO FINGERPRINT (top priority, all cores)
-            // ==========================================
-            async let photoHashWarmTask: Void = PhotoDedupeEngine.warmPhotoHashCache(
-                assets: photos,
-                cache: cacheRef,
-                progressHandler: { [weak self] p in
-                    Task { @MainActor in
-                        self?.photoDedupeProgress = p
-                        if p.isScanning {
-                            self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
-                        }
-                    }
-                }
-            )
-            
-            async let videoFingerprintWarmTask: Void = VideoDedupeEngine.warmVideoFingerprintCache(
-                videos: videos,
-                cache: cacheRef,
-                progressHandler: { [weak self] p in
-                    Task { @MainActor in
-                        self?.videoDedupeProgress = p
-                        if p.isScanning {
-                            self?.statusMessage = "Scanning videos (\(p.processed)/\(p.total))…"
-                        }
-                    }
-                }
-            )
-            
-            // ==========================================
-            // PHASE 2: PHOTO GROUPING (starts as soon as photo hashing finishes)
-            // ==========================================
-            await photoHashWarmTask
-            if Task.isCancelled { return }
-            
-            let partialSizes = await MainActor.run { self.sizeRecords }
-            
-            await MainActor.run {
-                self.currentStep = .photoDedupe
-                self.statusMessage = "Scanning photo duplicates…"
+            // Independent photo scan task: hashes + clusters, publishes groups on completion.
+            let photoScanTask = Task<DedupeScanResult, Never>.detached(priority: .userInitiated) { [weak self] in
+                guard let self = self else { return DedupeScanResult(duplicates: [], similars: []) }
+                return await self.runPhotoScan(assets: photos, cache: cacheRef)
             }
             
-            let photoResults = await PhotoDedupeEngine.scanPhotoDedupe(
-                assets: photos,
-                cache: cacheRef,
-                sizeRecords: partialSizes,
-                progressHandler: { [weak self] p in
-                    Task { @MainActor in
-                        self?.photoDedupeProgress = p
-                        if p.isScanning {
-                            self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
-                        }
-                    }
-                }
-            )
+            // Independent video scan task: fingerprints + clusters, publishes groups on completion.
+            let videoScanTask = Task<DedupeScanResult, Never>.detached(priority: .userInitiated) { [weak self] in
+                guard let self = self else { return DedupeScanResult(duplicates: [], similars: []) }
+                return await self.runVideoScan(videos: videos, cache: cacheRef)
+            }
             
+            // Publish photo groups the moment the photo scan finishes.
+            let photoResults = await photoScanTask.value
+            if Task.isCancelled { return }
             await MainActor.run {
                 self.photoDuplicates = photoResults.duplicates
                 self.photoSimilars = photoResults.similars
                 self.photoDedupeProgress = .done
             }
             
-            // ==========================================
-            // PHASE 3: VIDEO GROUPING (starts as soon as video fingerprinting finishes)
-            // ==========================================
-            await videoFingerprintWarmTask
+            // Publish video groups the moment the video scan finishes.
+            let videoResults = await videoScanTask.value
             if Task.isCancelled { return }
-            
-            await MainActor.run {
-                self.currentStep = .videoDedupe
-                self.statusMessage = "Scanning for duplicate videos…"
-            }
-            
-            let sizesForVideo = await MainActor.run { self.sizeRecords }
-            
-            let videoResults = await VideoDedupeEngine.scanVideoDedupe(
-                videos: videos,
-                cache: cacheRef,
-                sizeRecords: sizesForVideo,
-                progressHandler: { [weak self] p in
-                    Task { @MainActor in
-                        self?.videoDedupeProgress = p
-                    }
-                }
-            )
-            
             await MainActor.run {
                 self.videoDuplicates = videoResults.duplicates
                 self.videoSimilars = videoResults.similars
@@ -346,8 +281,8 @@ public final class PhotoManagerCoordinator {
             }
             
             // ==========================================
-            // PHASE 4: FULL-SPEED SIZE FETCH for the remaining uncached assets.
-            // Hashing + clustering are done, so the size fetch now gets full workers + utility QoS.
+            // FULL-SPEED SIZE FETCH for the remaining uncached assets.
+            // Both scans are done, so the size fetch now gets full workers + utility QoS.
             // ==========================================
             await sizeTrickleTask.value
             if Task.isCancelled { return }
@@ -376,7 +311,7 @@ public final class PhotoManagerCoordinator {
             await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
             
             // ==========================================
-            // PHASE 5: AI SORTING
+            // AI SORTING
             // ==========================================
             await MainActor.run {
                 self.currentStep = .aiSorting
@@ -397,6 +332,48 @@ public final class PhotoManagerCoordinator {
                 self.statusMessage = "Ready"
             }
         }
+    }
+    
+    /// Independent photo scan (hash + cluster) used by the detached pipeline task.
+    nonisolated private func runPhotoScan(
+        assets: [PHAsset],
+        cache: PhotoManagerCache
+    ) async -> DedupeScanResult {
+        let sizes = await MainActor.run { self.sizeRecords }
+        return await PhotoDedupeEngine.scanPhotoDedupe(
+            assets: assets,
+            cache: cache,
+            sizeRecords: sizes,
+            progressHandler: { [weak self] p in
+                Task { @MainActor in
+                    self?.photoDedupeProgress = p
+                    if p.isScanning {
+                        self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
+                    }
+                }
+            }
+        )
+    }
+    
+    /// Independent video scan (fingerprint + cluster) used by the detached pipeline task.
+    nonisolated private func runVideoScan(
+        videos: [PHAsset],
+        cache: PhotoManagerCache
+    ) async -> DedupeScanResult {
+        let sizes = await MainActor.run { self.sizeRecords }
+        return await VideoDedupeEngine.scanVideoDedupe(
+            videos: videos,
+            cache: cache,
+            sizeRecords: sizes,
+            progressHandler: { [weak self] p in
+                Task { @MainActor in
+                    self?.videoDedupeProgress = p
+                    if p.isScanning {
+                        self?.statusMessage = "Scanning videos (\(p.processed)/\(p.total))…"
+                    }
+                }
+            }
+        )
     }
     
     /// Resolves KVC file sizes completely off the main actor (nonisolated) so PhotoKit property
