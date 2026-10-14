@@ -134,11 +134,13 @@ public enum PhotoDedupeEngine {
                 }
                 
                 if currentProcessed % 50 == 0 || currentProcessed == totalCount {
+                    // Keep isScanning=true: grouping follows immediately after warming, and the card
+                    // must not flip to "Clean" in between.
                     progressHandler?(
                         ScanProgress(
                             processed: currentProcessed,
                             total: totalCount,
-                            isScanning: currentProcessed < totalCount
+                            isScanning: true
                         )
                     )
                 }

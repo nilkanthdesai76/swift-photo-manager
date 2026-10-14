@@ -139,9 +139,12 @@ public enum StorageCalculator {
     /// `PHAssetResource.assetResources(for:)` performs synchronous Photos I/O that blocks the calling
     /// thread. Dispatching it to a GCD worker keeps Swift concurrency executor threads free, so the
     /// size fetch can run at high concurrency without starving parallel hashing/grouping tasks.
-    public static func resolveExactSizeAsync(for asset: PHAsset) async -> AssetSizeRecord {
+    public static func resolveExactSizeAsync(
+        for asset: PHAsset,
+        qos: DispatchQoS.QoSClass = .utility
+    ) async -> AssetSizeRecord {
         await withCheckedContinuation { continuation in
-            DispatchQueue.global(qos: .utility).async {
+            DispatchQueue.global(qos: qos).async {
                 continuation.resume(returning: resolveExactSize(for: asset))
             }
         }

@@ -213,43 +213,49 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    /// Starts the fully concurrent background pipeline.
+    /// Starts the prioritized background pipeline.
     ///
-    /// The size fetch no longer blocks Swift executor threads (its Photos I/O is dispatched to GCD),
-    /// so it can run in parallel with photo hashing and video fingerprinting without starving them.
+    /// Strategy: hashing (photo + video) is the FIRST priority. Size fetching only trickles in the
+    /// leftover capacity (2 workers, background QoS) while hashing/clustering runs. Once both photo
+    /// and video grouping are done, the size fetch escalates to full worker count at utility QoS to
+    /// finish the remaining assets as fast as possible.
     ///
-    /// Phase 0: Exact KVC size resolution builds the reusable size index (runs in background).
-    /// Phase 0.5: Photo hashing + video fingerprinting run concurrently with Phase 0.
-    /// Phase 1: Photo grouping starts as soon as photo hashing finishes.
-    /// Phase 2: Video grouping starts as soon as video fingerprinting finishes.
-    /// Phase 3: Blur album + AI sorting wait for the size index to complete.
+    /// Phase 1: Photo hashing (+ video fingerprinting + size trickle run concurrently).
+    /// Phase 2: Photo grouping as soon as photo hashing finishes.
+    /// Phase 3: Video grouping as soon as video fingerprinting finishes.
+    /// Phase 4: Full-speed size fetch for the remaining uncached assets.
+    /// Phase 5: Blur album + AI sorting.
     private func startBackgroundPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
         let videos = self.allVideos
         let cacheRef = self.cache
         
-        Task.detached(priority: .utility) { [weak self] in
+        Task.detached(priority: .userInitiated) { [weak self] in
             guard let self = self else { return }
             
-            // ==========================================
-            // PHASE 0: SIZE INDEX (background, non-blocking)
-            // PHASE 0.5: PHOTO HASH + VIDEO FINGERPRINT (concurrent)
-            // ==========================================
             await MainActor.run {
                 self.currentStep = .fetchingSizes
                 self.isIndexing = true
-                self.statusMessage = "Indexing asset sizes…"
+                self.statusMessage = "Scanning library…"
             }
             
             let initialSizes = await MainActor.run { self.sizeRecords }
             
-            async let sizeResolverTask: Void = self.runKvcSizeResolver(
-                photos: photos,
-                videos: videos,
-                initialSizes: initialSizes,
-                cache: cacheRef
-            )
+            // Size fetch TRICKLE: low priority + few workers so hashing gets the CPU first.
+            let sizeTrickleTask = Task.detached(priority: .background) {
+                await self.runKvcSizeResolver(
+                    photos: photos,
+                    videos: videos,
+                    initialSizes: initialSizes,
+                    cache: cacheRef,
+                    maxConcurrent: 2,
+                    qos: .background
+                )
+            }
             
+            // ==========================================
+            // PHASE 1: PHOTO HASH + VIDEO FINGERPRINT (top priority, all cores)
+            // ==========================================
             async let photoHashWarmTask: Void = PhotoDedupeEngine.warmPhotoHashCache(
                 assets: photos,
                 cache: cacheRef,
@@ -277,7 +283,7 @@ public final class PhotoManagerCoordinator {
             )
             
             // ==========================================
-            // PHASE 1: PHOTO GROUPING (starts as soon as photo hashing finishes)
+            // PHASE 2: PHOTO GROUPING (starts as soon as photo hashing finishes)
             // ==========================================
             await photoHashWarmTask
             if Task.isCancelled { return }
@@ -310,7 +316,7 @@ public final class PhotoManagerCoordinator {
             }
             
             // ==========================================
-            // PHASE 2: VIDEO GROUPING (starts as soon as video fingerprinting finishes)
+            // PHASE 3: VIDEO GROUPING (starts as soon as video fingerprinting finishes)
             // ==========================================
             await videoFingerprintWarmTask
             if Task.isCancelled { return }
@@ -340,9 +346,28 @@ public final class PhotoManagerCoordinator {
             }
             
             // ==========================================
-            // PHASE 3: WAIT FOR SIZE INDEX, THEN BLUR ALBUM + AI SORTING
+            // PHASE 4: FULL-SPEED SIZE FETCH for the remaining uncached assets.
+            // Hashing + clustering are done, so the size fetch now gets full workers + utility QoS.
             // ==========================================
-            await sizeResolverTask
+            await sizeTrickleTask.value
+            if Task.isCancelled { return }
+            
+            let trickleProgress = await cacheRef.getAllSizes()
+            
+            await MainActor.run {
+                self.currentStep = .fetchingSizes
+                self.statusMessage = "Indexing asset sizes…"
+            }
+            
+            await self.runKvcSizeResolver(
+                photos: photos,
+                videos: videos,
+                initialSizes: trickleProgress,
+                cache: cacheRef,
+                maxConcurrent: max(8, min(16, ProcessInfo.processInfo.processorCount)),
+                qos: .utility
+            )
+            
             if Task.isCancelled { return }
             
             let sizeIndex = await MainActor.run { self.sizeRecords }
@@ -351,7 +376,7 @@ public final class PhotoManagerCoordinator {
             await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
             
             // ==========================================
-            // PHASE 3.5: AI SORTING
+            // PHASE 5: AI SORTING
             // ==========================================
             await MainActor.run {
                 self.currentStep = .aiSorting
@@ -381,7 +406,9 @@ public final class PhotoManagerCoordinator {
         photos: [PHAsset],
         videos: [PHAsset],
         initialSizes: [String: AssetSizeRecord],
-        cache: PhotoManagerCache
+        cache: PhotoManagerCache,
+        maxConcurrent: Int = 8,
+        qos: DispatchQoS.QoSClass = .utility
     ) async {
         let uncachedAssets = (photos + videos).filter { initialSizes[$0.localIdentifier] == nil }
         guard !uncachedAssets.isEmpty else { return }
@@ -418,8 +445,8 @@ public final class PhotoManagerCoordinator {
         // Bounded pipeline: keep a fixed number of chunk tasks in flight at all times.
         // The per-asset size resolution is offloaded to GCD (`resolveExactSizeAsync`), so these
         // tasks are lightweight suspended continuations that never block a Swift executor thread.
-        // That means we can run many in parallel without starving hashing/grouping tasks.
-        let maxConcurrent = max(8, min(16, ProcessInfo.processInfo.processorCount))
+        // Callers choose the width/QoS: a narrow trickle while hashing runs, full width afterwards.
+        let maxConcurrent = max(1, maxConcurrent)
         let chunkStream = AsyncStream<[PHAsset]> { continuation in
             for chunk in chunks { continuation.yield(chunk) }
             continuation.finish()
@@ -445,7 +472,7 @@ public final class PhotoManagerCoordinator {
             for asset in chunk {
                 if Task.isCancelled { break }
                 // Non-blocking: the Photos I/O happens on a GCD worker thread.
-                let rec = await StorageCalculator.resolveExactSizeAsync(for: asset)
+                let rec = await StorageCalculator.resolveExactSizeAsync(for: asset, qos: qos)
                 batch[asset.localIdentifier] = rec
                 
                 if asset.mediaType == .video {
