@@ -10,26 +10,42 @@ import UIKit
 import AppKit
 #endif
 
-/// Thread-safe in-memory cache for rendered thumbnails.
+/// Thread-safe cached thumbnail item holding rendered image and media metadata.
+private final class CachedThumbnailItem {
+    let image: PlatformImage
+    let isVideo: Bool
+    let isLivePhoto: Bool
+    let durationString: String?
+    
+    init(image: PlatformImage, isVideo: Bool, isLivePhoto: Bool, durationString: String?) {
+        self.image = image
+        self.isVideo = isVideo
+        self.isLivePhoto = isLivePhoto
+        self.durationString = durationString
+    }
+}
+
+/// Thread-safe in-memory cache for rendered thumbnails and badges.
 private final class ThumbnailCache {
     static let shared = ThumbnailCache()
-    private let cache = NSCache<NSString, PlatformImage>()
+    private let cache = NSCache<NSString, CachedThumbnailItem>()
     
     private init() {
         cache.countLimit = 600
         cache.totalCostLimit = 64 * 1024 * 1024 // 64 MB
     }
     
-    func image(for id: String) -> PlatformImage? {
+    func item(for id: String) -> CachedThumbnailItem? {
         cache.object(forKey: id as NSString)
     }
     
-    func insert(_ image: PlatformImage, for id: String) {
-        cache.setObject(image, forKey: id as NSString)
+    func insert(_ item: CachedThumbnailItem, for id: String) {
+        cache.setObject(item, forKey: id as NSString)
     }
 }
 
 /// High-performance PhotoKit thumbnail view with in-memory caching and strict 1:1 clipping.
+/// Executes all PhotoKit fetches and property accesses off the main thread to prevent main queue stalls.
 public struct AssetThumbnailView: View {
     public let assetID: String
     public var targetSize: CGSize
@@ -115,43 +131,74 @@ public struct AssetThumbnailView: View {
     
     private func loadThumbnail() {
         #if canImport(Photos)
-        if let cached = ThumbnailCache.shared.image(for: assetID) {
-            self.platformImage = cached
+        // 1. Instant cache hit on MainActor (< 0.001ms)
+        if let cached = ThumbnailCache.shared.item(for: assetID) {
+            self.platformImage = cached.image
+            self.isVideo = cached.isVideo
+            self.isLivePhoto = cached.isLivePhoto
+            self.durationString = cached.durationString
             return
         }
-        
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
-        guard let asset = fetchResult.firstObject else { return }
-        
-        self.isVideo = asset.mediaType == .video
-        self.isLivePhoto = asset.mediaSubtypes.contains(.photoLive)
-        if self.isVideo {
-            let dur = Int(asset.duration)
-            self.durationString = String(format: "%d:%02d", dur / 60, dur % 60)
-        }
-        
-        let options = PHImageRequestOptions()
-        options.isNetworkAccessAllowed = false
-        options.resizeMode = .fast
-        options.deliveryMode = .opportunistic
-        options.isSynchronous = false
         
         #if canImport(UIKit)
         let scale = UIScreen.main.scale
         #else
         let scale: CGFloat = 2.0
         #endif
-        let pixelSize = CGSize(width: targetSize.width * scale, height: targetSize.height * scale)
         
-        self.requestID = PHImageManager.default().requestImage(
-            for: asset,
-            targetSize: pixelSize,
-            contentMode: .aspectFill,
-            options: options
-        ) { image, info in
-            if let img = image {
-                ThumbnailCache.shared.insert(img, for: assetID)
-                self.platformImage = img
+        let id = self.assetID
+        let target = self.targetSize
+        
+        // 2. Offload PHAsset fetch and requestImage completely to background queue.
+        // Eliminates "Missing prefetched properties for PHAssetOriginalMetadataProperties on main queue" warnings.
+        DispatchQueue.global(qos: .userInteractive).async {
+            autoreleasepool {
+                let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+                guard let asset = fetchResult.firstObject else { return }
+                
+                let isVid = asset.mediaType == .video
+                let isLive = asset.mediaSubtypes.contains(.photoLive)
+                var durStr: String? = nil
+                if isVid {
+                    let dur = Int(asset.duration)
+                    durStr = String(format: "%d:%02d", dur / 60, dur % 60)
+                }
+                
+                let options = PHImageRequestOptions()
+                options.isNetworkAccessAllowed = false
+                options.resizeMode = .fast
+                options.deliveryMode = .opportunistic
+                options.isSynchronous = false
+                
+                let pixelSize = CGSize(width: target.width * scale, height: target.height * scale)
+                
+                let reqID = PHImageManager.default().requestImage(
+                    for: asset,
+                    targetSize: pixelSize,
+                    contentMode: .aspectFill,
+                    options: options
+                ) { image, _ in
+                    if let img = image {
+                        let item = CachedThumbnailItem(
+                            image: img,
+                            isVideo: isVid,
+                            isLivePhoto: isLive,
+                            durationString: durStr
+                        )
+                        ThumbnailCache.shared.insert(item, for: id)
+                        
+                        DispatchQueue.main.async {
+                            self.platformImage = img
+                            self.isVideo = isVid
+                            self.isLivePhoto = isLive
+                            self.durationString = durStr
+                        }
+                    }
+                }
+                
+                DispatchQueue.main.async {
+                    self.requestID = reqID
+                }
             }
         }
         #endif

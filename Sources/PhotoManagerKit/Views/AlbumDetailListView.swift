@@ -276,14 +276,22 @@ public struct AlbumDetailListView: View {
     private func loadAssetDates() {
         #if canImport(Photos)
         guard !item.assetIDs.isEmpty else { return }
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: item.assetIDs, options: nil)
-        var dates: [String: Date] = [:]
-        fetch.enumerateObjects { asset, _, _ in
-            if let d = asset.creationDate {
-                dates[asset.localIdentifier] = d
+        let ids = item.assetIDs
+        
+        Task.detached(priority: .userInitiated) {
+            let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+            var dates: [String: Date] = [:]
+            dates.reserveCapacity(fetch.count)
+            fetch.enumerateObjects { asset, _, _ in
+                if let d = asset.creationDate {
+                    dates[asset.localIdentifier] = d
+                }
+            }
+            let finalDates = dates
+            await MainActor.run {
+                self.assetCreationDates = finalDates
             }
         }
-        self.assetCreationDates = dates
         #endif
     }
     

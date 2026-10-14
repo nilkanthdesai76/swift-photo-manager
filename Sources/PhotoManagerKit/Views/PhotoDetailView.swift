@@ -275,39 +275,51 @@ public struct PhotoDetailView: View {
     
     private func loadFullAsset() {
         #if canImport(Photos)
-        let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [assetID], options: nil)
-        guard let phAsset = fetchResult.firstObject else {
-            self.isLoadingImage = false
-            return
-        }
-        self.asset = phAsset
-        self.isFavorite = phAsset.isFavorite
+        let id = assetID
+        self.isLoadingImage = true
         
-        if self.currentSizeRecord == nil {
-            self.currentSizeRecord = StorageCalculator.resolveExactSize(for: phAsset)
-        }
-        
-        let options = PHImageRequestOptions()
-        options.isNetworkAccessAllowed = true
-        options.deliveryMode = .highQualityFormat
-        options.resizeMode = .exact
-        
-        #if canImport(UIKit)
-        let screen = UIScreen.main.bounds
-        let targetSize = CGSize(width: screen.width * 2, height: screen.height * 2)
-        #else
-        let targetSize = CGSize(width: 1600, height: 1600)
-        #endif
-        
-        PHImageManager.default().requestImage(
-            for: phAsset,
-            targetSize: targetSize,
-            contentMode: .aspectFit,
-            options: options
-        ) { image, _ in
-            if let img = image {
-                self.highResImage = img
-                self.isLoadingImage = false
+        Task.detached(priority: .userInitiated) {
+            let fetchResult = PHAsset.fetchAssets(withLocalIdentifiers: [id], options: nil)
+            guard let phAsset = fetchResult.firstObject else {
+                await MainActor.run { self.isLoadingImage = false }
+                return
+            }
+            
+            let isFav = phAsset.isFavorite
+            let sizeRec = StorageCalculator.resolveExactSize(for: phAsset)
+            
+            await MainActor.run {
+                self.asset = phAsset
+                self.isFavorite = isFav
+                if self.currentSizeRecord == nil {
+                    self.currentSizeRecord = sizeRec
+                }
+            }
+            
+            let options = PHImageRequestOptions()
+            options.isNetworkAccessAllowed = true
+            options.deliveryMode = .highQualityFormat
+            options.resizeMode = .exact
+            
+            #if canImport(UIKit)
+            let screen = UIScreen.main.bounds
+            let targetSize = CGSize(width: screen.width * 2, height: screen.height * 2)
+            #else
+            let targetSize = CGSize(width: 1600, height: 1600)
+            #endif
+            
+            PHImageManager.default().requestImage(
+                for: phAsset,
+                targetSize: targetSize,
+                contentMode: .aspectFit,
+                options: options
+            ) { image, _ in
+                if let img = image {
+                    Task { @MainActor in
+                        self.highResImage = img
+                        self.isLoadingImage = false
+                    }
+                }
             }
         }
         #endif

@@ -225,14 +225,22 @@ public struct MonthPhotoListView: View {
     private func loadAssetDates() {
         #if canImport(Photos)
         guard !month.assetIDs.isEmpty else { return }
-        let fetch = PHAsset.fetchAssets(withLocalIdentifiers: month.assetIDs, options: nil)
-        var dates: [String: Date] = [:]
-        fetch.enumerateObjects { asset, _, _ in
-            if let d = asset.creationDate {
-                dates[asset.localIdentifier] = d
+        let ids = month.assetIDs
+        
+        Task.detached(priority: .userInitiated) {
+            let fetch = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: nil)
+            var dates: [String: Date] = [:]
+            dates.reserveCapacity(fetch.count)
+            fetch.enumerateObjects { asset, _, _ in
+                if let d = asset.creationDate {
+                    dates[asset.localIdentifier] = d
+                }
+            }
+            let finalDates = dates
+            await MainActor.run {
+                self.assetCreationDates = finalDates
             }
         }
-        self.assetCreationDates = dates
         #endif
     }
 }
