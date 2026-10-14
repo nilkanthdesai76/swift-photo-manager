@@ -72,6 +72,77 @@ public enum PhotoDedupeEngine {
         _ = await hashAndCachePhotos(assets: assets, cache: cache, progressHandler: progressHandler)
     }
     
+    /// One-time backfill for libraries that were hashed BEFORE blur detection existed:
+    /// requests the same 32x32 thumbnails and computes blur flags for every photo that
+    /// is not already flagged, without touching the hash cache.
+    public static func backfillBlurFlags(
+        assets: [PHAsset],
+        cache: PhotoManagerCache = .shared
+    ) async {
+        guard !assets.isEmpty else { return }
+        let alreadyFlagged = await cache.getBlurryPhotoIDs()
+        
+        let imageManager = PHImageManager.default()
+        let requestOptions = PHImageRequestOptions()
+        requestOptions.isSynchronous = true
+        requestOptions.resizeMode = .fast
+        requestOptions.deliveryMode = .fastFormat
+        requestOptions.isNetworkAccessAllowed = false
+        let targetSize = CGSize(width: 32, height: 32)
+        
+        var batchBlurry: [String] = []
+        batchBlurry.reserveCapacity(200)
+        
+        for asset in assets {
+            if Task.isCancelled { break }
+            let id = asset.localIdentifier
+            guard !alreadyFlagged.contains(id) else { continue }
+            
+            let isBlurry = await detectBlur(for: asset, manager: imageManager, options: requestOptions, targetSize: targetSize)
+            if isBlurry {
+                batchBlurry.append(id)
+            }
+            
+            if batchBlurry.count >= 200 {
+                await cache.putBlurryPhotoIDs(batchBlurry)
+                batchBlurry.removeAll(keepingCapacity: true)
+                await Task.yield()
+            }
+        }
+        
+        if !batchBlurry.isEmpty {
+            await cache.putBlurryPhotoIDs(batchBlurry)
+        }
+    }
+    
+    /// Renders a 32x32 thumbnail and runs the blur heuristic on it.
+    private static func detectBlur(
+        for asset: PHAsset,
+        manager: PHImageManager,
+        options: PHImageRequestOptions,
+        targetSize: CGSize
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            _ = autoreleasepool {
+                manager.requestImage(
+                    for: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFill,
+                    options: options
+                ) { image, _ in
+                    #if canImport(UIKit)
+                    if let cgImage = image?.cgImage,
+                       let raw = sampleGrayBytes(from: cgImage, width: 9, height: 8) {
+                        continuation.resume(returning: isBlurryPhoto(raw, width: 9, height: 8))
+                        return
+                    }
+                    #endif
+                    continuation.resume(returning: false)
+                }
+            }
+        }
+    }
+    
     /// Hashes every photo that isn't already cached, persists the hashes (and blur flags), and
     /// returns a complete ID→hash map including previously cached entries.
     private static func hashAndCachePhotos(

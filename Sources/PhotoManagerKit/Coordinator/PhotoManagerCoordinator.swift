@@ -305,9 +305,15 @@ public final class PhotoManagerCoordinator {
             }
             
             // ==========================================
-            // WAVE 2: SIZE FETCH + AI SORTING START TOGETHER (concurrent, full speed)
+            // WAVE 2: SIZE FETCH + AI SORTING + BLUR BACKFILL (concurrent, full speed)
+            // BLUR BACKFILL: libraries hashed before blur detection existed have hash caches but
+            // no blur flags (their scan is now skipped) — run the one-time backfill alongside.
             // ==========================================
             if Task.isCancelled { return }
+            
+            let blurScanComplete = await cacheRef.isBlurScanComplete()
+            let blurBackfillNeeded = !photos.isEmpty && (blurScanComplete == false)
+            async let blurBackfillTask: Void = blurBackfillNeeded ? self.runBlurBackfill(photos: photos, cache: cacheRef) : ()
             
             let currentSizes = await MainActor.run { self.sizeRecords }
             
@@ -348,9 +354,10 @@ public final class PhotoManagerCoordinator {
             // Build the Blurry Photos album with the complete size index for accurate totals.
             await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: completedSizes, cache: cacheRef)
             
-            // Wait for AI sorting to finish before declaring the pipeline complete.
+            // Wait for AI sorting and the blur backfill before declaring the pipeline complete.
             await aiTask
             if Task.isCancelled { return }
+            await blurBackfillTask
             
             // ==========================================
             // PIPELINE COMPLETE
@@ -411,6 +418,17 @@ public final class PhotoManagerCoordinator {
                 }
             }
         )
+    }
+    
+    /// One-time blur backfill for pre-existing hash caches; marks completion and builds the album.
+    nonisolated private func runBlurBackfill(
+        photos: [PHAsset],
+        cache: PhotoManagerCache
+    ) async {
+        await PhotoDedupeEngine.backfillBlurFlags(assets: photos, cache: cache)
+        await cache.markBlurScanComplete()
+        let sizes = await MainActor.run { self.sizeRecords }
+        await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizes, cache: cache)
     }
     
     /// Resolves KVC file sizes completely off the main actor (nonisolated) so PhotoKit property

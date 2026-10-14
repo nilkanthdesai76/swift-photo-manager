@@ -60,6 +60,7 @@ public actor PhotoManagerCache {
     private var blurryPhotoIDs: Set<String> = []
     private var photoScanCompleted = false
     private var videoScanCompleted = false
+    private var blurScanCompleted = false
     
     private var isDirty = false
     private var didBootstrap = false
@@ -77,6 +78,7 @@ public actor PhotoManagerCache {
         var blurryPhotoIDs: [String]?
         var photoScanCompleted: Bool?
         var videoScanCompleted: Bool?
+        var blurScanCompleted: Bool?
     }
     
     public init() {
@@ -105,6 +107,7 @@ public actor PhotoManagerCache {
             self.blurryPhotoIDs = Set(env.blurryPhotoIDs ?? [])
             self.photoScanCompleted = env.photoScanCompleted ?? false
             self.videoScanCompleted = env.videoScanCompleted ?? false
+            self.blurScanCompleted = env.blurScanCompleted ?? false
         }
     }
     
@@ -183,6 +186,8 @@ public actor PhotoManagerCache {
         self.photoDuplicates = duplicates
         self.photoSimilars = similars
         self.photoScanCompleted = true
+        // A full photo scan also detects blur for every uncached asset it hashes.
+        self.blurScanCompleted = true
         isDirty = true
         scheduleDebouncedSave()
     }
@@ -198,6 +203,17 @@ public actor PhotoManagerCache {
     /// True when a full photo scan (hash + cluster) has completed for the library.
     public func isPhotoScanComplete() -> Bool {
         photoScanCompleted
+    }
+    
+    /// True when every photo has passed through blur detection (via scan or backfill).
+    public func isBlurScanComplete() -> Bool {
+        blurScanCompleted
+    }
+    
+    public func markBlurScanComplete() {
+        blurScanCompleted = true
+        isDirty = true
+        scheduleDebouncedSave()
     }
     
     /// True when a full video scan (fingerprint + cluster) has completed for the library.
@@ -255,7 +271,8 @@ public actor PhotoManagerCache {
             aiCategories: aiCategories,
             blurryPhotoIDs: Array(blurryPhotoIDs),
             photoScanCompleted: photoScanCompleted,
-            videoScanCompleted: videoScanCompleted
+            videoScanCompleted: videoScanCompleted,
+            blurScanCompleted: blurScanCompleted
         )
         let url = fileURL
         
@@ -279,6 +296,7 @@ public actor PhotoManagerCache {
         blurryPhotoIDs.removeAll()
         photoScanCompleted = false
         videoScanCompleted = false
+        blurScanCompleted = false
         isDirty = false
         try? FileManager.default.removeItem(at: fileURL)
     }
@@ -289,6 +307,7 @@ public actor PhotoManagerCache {
         photoHashes.removeAll()
         blurryPhotoIDs.removeAll()
         photoScanCompleted = false
+        blurScanCompleted = false
         isDirty = true
         scheduleDebouncedSave()
     }
