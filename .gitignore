@@ -1,9 +1,13 @@
+# macOS / Xcode
 .DS_Store
 .build/
 Packages/
 xcuserdata/
 DerivedData/
 *.xcworkspace
-!Demo/Demo.xcodeproj/project.xcworkspace
 *.xcuserdatad/
 .swiftpm/
+
+# Local Demo & Development Scripts (kept locally, not published with SPM package)
+Demo/
+launch-demo.sh

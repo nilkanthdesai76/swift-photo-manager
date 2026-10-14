@@ -1,5 +1,6 @@
 import XCTest
 @testable import PhotoManagerKit
+import PhotoKitManager
 
 final class PhotoManagerKitTests: XCTestCase {
     
@@ -182,4 +183,13 @@ final class PhotoManagerKitTests: XCTestCase {
         let clearedCat = await cache.getAICategory(for: "PHOTO_SHIRT")
         XCTAssertNil(clearedCat)
     }
+    
+    // MARK: - 9. PhotoKitManager Umbrella Import Test
+    
+    func testPhotoKitManagerUmbrellaModule() {
+        let overview = PhotoKitManager.LibraryStorageOverview.empty
+        XCTAssertEqual(overview.totalBytes, 0)
+        XCTAssertEqual(PhotoKitManager.ByteFormatter.format(bytes: 1024), "1 KB")
+    }
 }
+
