@@ -120,9 +120,10 @@ public final class PhotoManagerCoordinator {
         // 3. Publish snapshot instantly (takes < 1ms on main thread)
         self.applySnapshot(snapshot)
         
-        // 4. Launch sequential one-by-one background pipelines
-        self.startSequentialPipelines(cachedAICats: cachedAICats)
+        // 4. Launch background pipelines (KVC sizes & photo dedupe run alongside on utility threads)
+        self.startBackgroundPipelines(cachedAICats: cachedAICats)
         #endif
+
     }
     
     #if canImport(Photos)
@@ -203,9 +204,11 @@ public final class PhotoManagerCoordinator {
         )
     }
     
-    /// Starts background execution strictly one-by-one in sequence:
-    /// 1. Exact KVC size resolution -> 2. Photo deduplication -> 3. Video deduplication -> 4. AI sorting
-    private func startSequentialPipelines(cachedAICats: [String: String]) {
+    /// Starts background execution:
+    /// Phase 1: Exact KVC size resolution & Photo deduplication run concurrently alongside each other on utility threads.
+    /// Phase 2: Video deduplication.
+    /// Phase 3: AI sorting.
+    private func startBackgroundPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
         let videos = self.allVideos
         let cacheRef = self.cache
@@ -214,50 +217,59 @@ public final class PhotoManagerCoordinator {
             guard let self = self else { return }
             
             // ==========================================
-            // STEP 1: SIZE FETCH (Exact KVC sizes)
-            // ==========================================
-            await MainActor.run {
-                self.currentStep = .fetchingSizes
-                self.isIndexing = true
-                self.statusMessage = "Resolving file sizes via KVC…"
-            }
-            await self.runKvcSizeResolver()
-            
-            if Task.isCancelled { return }
-            
-            // ==========================================
-            // STEP 2: SIMILAR & DUPLICATE FOR PHOTOS
+            // PHASE 1: SIZE FETCH & PHOTO DEDUPE RUN CONCURRENTLY
             // ==========================================
             await MainActor.run {
                 self.currentStep = .photoDedupe
-                self.statusMessage = "Scanning for similar & duplicate photos…"
+                self.isIndexing = true
+                self.statusMessage = "Analyzing storage & scanning duplicates…"
             }
-            let currentSizes = await MainActor.run { self.sizeRecords }
-            let photoResults = await PhotoDedupeEngine.scanPhotoDedupe(
+            
+            let initialSizes = await MainActor.run { self.sizeRecords }
+            
+            // Launch KVC size resolution on utility background thread
+            async let sizeResolverTask: Void = self.runKvcSizeResolver(
+                photos: photos,
+                videos: videos,
+                initialSizes: initialSizes,
+                cache: cacheRef
+            )
+            
+            // Launch photo dedupe concurrently on utility background thread
+            async let photoDedupeTask = PhotoDedupeEngine.scanPhotoDedupe(
                 assets: photos,
                 cache: cacheRef,
-                sizeRecords: currentSizes,
+                sizeRecords: initialSizes,
                 progressHandler: { [weak self] p in
                     Task { @MainActor in
                         self?.photoDedupeProgress = p
+                        if p.isScanning {
+                            self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
+                        }
                     }
                 }
             )
+            
+            let photoResults = await photoDedupeTask
             await MainActor.run {
                 self.photoDuplicates = photoResults.duplicates
                 self.photoSimilars = photoResults.similars
                 self.photoDedupeProgress = .done
             }
             
+            // Ensure size resolver is finished before proceeding to videos
+            _ = await sizeResolverTask
+            
             if Task.isCancelled { return }
             
             // ==========================================
-            // STEP 3: SIMILAR & DUPLICATE FOR VIDEOS
+            // PHASE 2: SIMILAR & DUPLICATE FOR VIDEOS
             // ==========================================
             await MainActor.run {
                 self.currentStep = .videoDedupe
                 self.statusMessage = "Scanning for duplicate videos…"
             }
+            let currentSizes = await MainActor.run { self.sizeRecords }
             let videoResults = await VideoDedupeEngine.scanVideoDedupe(
                 videos: videos,
                 cache: cacheRef,
@@ -277,7 +289,7 @@ public final class PhotoManagerCoordinator {
             if Task.isCancelled { return }
             
             // ==========================================
-            // STEP 4: AI SORTING
+            // PHASE 3: AI SORTING
             // ==========================================
             await MainActor.run {
                 self.currentStep = .aiSorting
@@ -300,21 +312,41 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    private func runKvcSizeResolver() async {
-        let (photos, videos, currentSizes) = await MainActor.run {
-            (self.allPhotos, self.allVideos, self.sizeRecords)
-        }
-        let uncachedAssets = (photos + videos).filter { currentSizes[$0.localIdentifier] == nil }
-        guard !uncachedAssets.isEmpty else {
-            return
-        }
+    /// Resolves KVC file sizes completely on utility thread without freezing the main actor.
+    /// Accumulates byte sums in O(1) arithmetic and throttles UI updates to avoid main thread pressure.
+    private func runKvcSizeResolver(
+        photos: [PHAsset],
+        videos: [PHAsset],
+        initialSizes: [String: AssetSizeRecord],
+        cache: PhotoManagerCache
+    ) async {
+        let uncachedAssets = (photos + videos).filter { initialSizes[$0.localIdentifier] == nil }
+        guard !uncachedAssets.isEmpty else { return }
         
-        let chunkSize = 50
+        let chunkSize = 100
         let chunks: [[PHAsset]] = stride(from: 0, to: uncachedAssets.count, by: chunkSize).map {
             Array(uncachedAssets[$0..<min($0 + chunkSize, uncachedAssets.count)])
         }
         
-        for chunk in chunks {
+        // Calculate initial baseline on utility background thread
+        let baseline = StorageCalculator.computeOverview(
+            photos: photos,
+            videos: videos,
+            sizeRecords: initialSizes
+        )
+        var runningPhotosBytes = baseline.photosBytes
+        var runningLPStillBytes = baseline.livePhotosStillBytes
+        var runningLPVideoBytes = baseline.livePhotosVideoBytes
+        var runningVideosBytes = baseline.videosBytes
+        let regularPhotoCount = baseline.photosCount
+        let lpCount = baseline.livePhotosCount
+        let totalCount = baseline.totalCount
+        let videoCount = baseline.videosCount
+        
+        var accumulatedBatch: [String: AssetSizeRecord] = [:]
+        accumulatedBatch.reserveCapacity(250)
+        
+        for (chunkIndex, chunk) in chunks.enumerated() {
             if Task.isCancelled { break }
             
             var batch: [String: AssetSizeRecord] = [:]
@@ -323,34 +355,58 @@ public final class PhotoManagerCoordinator {
             for asset in chunk {
                 let rec = StorageCalculator.resolveExactSize(for: asset)
                 batch[asset.localIdentifier] = rec
+                
+                if asset.mediaType == .video {
+                    runningVideosBytes += rec.totalBytes
+                } else if asset.mediaSubtypes.contains(.photoLive) {
+                    runningLPStillBytes += rec.stillBytes
+                    runningLPVideoBytes += rec.videoBytes
+                } else {
+                    runningPhotosBytes += rec.totalBytes
+                }
             }
             
+            accumulatedBatch.merge(batch) { _, new in new }
             await cache.putSizeBatch(batch)
             
-            await MainActor.run {
-                for (id, rec) in batch {
-                    self.sizeRecords[id] = rec
-                }
-                self.storageOverview = StorageCalculator.computeOverview(
-                    photos: self.allPhotos,
-                    videos: self.allVideos,
-                    sizeRecords: self.sizeRecords
+            // Dispatch UI updates periodically every 200 items or on last chunk (takes < 0.05ms on MainActor)
+            let isLastChunk = chunkIndex == chunks.count - 1
+            if accumulatedBatch.count >= 200 || isLastChunk {
+                let updatedOverview = LibraryStorageOverview(
+                    totalBytes: runningPhotosBytes + runningLPStillBytes + runningLPVideoBytes + runningVideosBytes,
+                    totalCount: totalCount,
+                    photosBytes: runningPhotosBytes,
+                    photosCount: regularPhotoCount,
+                    livePhotosTotalBytes: runningLPStillBytes + runningLPVideoBytes,
+                    livePhotosStillBytes: runningLPStillBytes,
+                    livePhotosVideoBytes: runningLPVideoBytes,
+                    livePhotosCount: lpCount,
+                    videosBytes: runningVideosBytes,
+                    videosCount: videoCount,
+                    otherBytes: 0,
+                    otherCount: 0,
+                    isEstimated: false
                 )
+                
+                let dispatchBatch = accumulatedBatch
+                accumulatedBatch.removeAll(keepingCapacity: true)
+                
+                await MainActor.run {
+                    self.sizeRecords.merge(dispatchBatch) { _, new in new }
+                    self.storageOverview = updatedOverview
+                }
             }
             
             await Task.yield()
         }
         
-        // Final refresh of size-dependent collections once all sizes are resolved
-        let (finalPhotos, finalVideos, finalSizes) = await MainActor.run {
-            (self.allPhotos, self.allVideos, self.sizeRecords)
-        }
-        
-        let pSmart = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: finalSizes)
-        let vSmart = SmartAlbumScanner.fetchVideoSmartAlbums(videos: finalVideos, sizeRecords: finalSizes)
-        let lPhotos = SmartAlbumScanner.filterLargePhotos(photos: finalPhotos, sizeRecords: finalSizes)
-        let lVideos = SmartAlbumScanner.filterLargeVideos(videos: finalVideos, sizeRecords: finalSizes)
-        let timeline = TimelineAndAIScanner.buildTimeline(photos: finalPhotos, sizeRecords: finalSizes)
+        // Final background refresh of size-dependent collections once all sizes are resolved
+        let allCurrentSizes = await cache.getAllSizes()
+        let pSmart = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: allCurrentSizes)
+        let vSmart = SmartAlbumScanner.fetchVideoSmartAlbums(videos: videos, sizeRecords: allCurrentSizes)
+        let lPhotos = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: allCurrentSizes)
+        let lVideos = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: allCurrentSizes)
+        let timeline = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: allCurrentSizes)
         
         await MainActor.run {
             self.photoSmartAlbums = pSmart

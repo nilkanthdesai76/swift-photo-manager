@@ -11,6 +11,7 @@ import UIKit
 
 /// High-throughput perceptual hashing & duplicate clustering engine for videos.
 /// Emits live progress directly to video cards and caches fingerprints to disk.
+/// Optimized for large libraries with memory-bounded clustering and fast duration pruning.
 public enum VideoDedupeEngine {
     
     #if canImport(Photos)
@@ -32,7 +33,7 @@ public enum VideoDedupeEngine {
         videoRecords.reserveCapacity(totalCount)
         
         var uncachedVideos: [PHAsset] = []
-        uncachedVideos.reserveCapacity(totalCount)
+        uncachedVideos.reserveCapacity(min(totalCount, 2000))
         
         // Step 1: Check in-memory fingerprint cache (< 2ms)
         for video in videos {
@@ -78,6 +79,7 @@ public enum VideoDedupeEngine {
                 if batch.count >= 50 {
                     await cache.putVideoFingerprints(batch)
                     batch.removeAll(keepingCapacity: true)
+                    await Task.yield()
                 }
                 
                 if currentProcessed % 10 == 0 || currentProcessed == totalCount {
@@ -96,11 +98,10 @@ public enum VideoDedupeEngine {
             }
         }
         
-        progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
-        
         // Step 3: Cluster into Duplicate & Similar Groups
-        let clustered = clusterVideos(videoRecords, sizeRecords: sizeRecords)
+        let clustered = await clusterVideos(videoRecords, sizeRecords: sizeRecords)
         await cache.putVideoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
+        progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
         return clustered
     }
     
@@ -111,82 +112,108 @@ public enum VideoDedupeEngine {
         targetSize: CGSize
     ) async -> VideoFingerprintRecord {
         return await withCheckedContinuation { continuation in
-            manager.requestImage(
-                for: asset,
-                targetSize: targetSize,
-                contentMode: .aspectFill,
-                options: options
-            ) { image, _ in
-                var hash: UInt64 = 0
-                #if canImport(UIKit)
-                if let cgImage = image?.cgImage {
-                    hash = PhotoDedupeEngine.computeDHash64(from: cgImage)
+            _ = autoreleasepool {
+                manager.requestImage(
+                    for: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFill,
+                    options: options
+                ) { image, _ in
+                    var hash: UInt64 = 0
+                    #if canImport(UIKit)
+                    if let cgImage = image?.cgImage {
+                        hash = PhotoDedupeEngine.computeDHash64(from: cgImage)
+                    }
+                    #endif
+                    if hash == 0 {
+                        hash = UInt64(asset.pixelWidth ^ asset.pixelHeight ^ Int(asset.duration * 100))
+                    }
+                    
+                    let fp = VideoFingerprintRecord(
+                        duration: asset.duration,
+                        keyframeHash: hash,
+                        pixelWidth: asset.pixelWidth,
+                        pixelHeight: asset.pixelHeight
+                    )
+                    continuation.resume(returning: fp)
                 }
-                #endif
-                if hash == 0 {
-                    hash = UInt64(asset.pixelWidth ^ asset.pixelHeight ^ Int(asset.duration * 100))
-                }
-                
-                let fp = VideoFingerprintRecord(
-                    duration: asset.duration,
-                    keyframeHash: hash,
-                    pixelWidth: asset.pixelWidth,
-                    pixelHeight: asset.pixelHeight
-                )
-                continuation.resume(returning: fp)
             }
         }
+    }
+    
+    private struct CompactVideoItem: Sendable {
+        let originalIndex: Int
+        let duration: TimeInterval
+        let keyframeHash: UInt64
     }
     
     private static func clusterVideos(
         _ list: [(asset: PHAsset, fingerprint: VideoFingerprintRecord)],
         sizeRecords: [String: AssetSizeRecord]
-    ) -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
-        // Sort by duration for fast candidate pruning
-        let sorted = list.sorted { $0.fingerprint.duration < $1.fingerprint.duration }
+    ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
+        let totalCount = list.count
+        guard totalCount > 1 else { return ([], []) }
         
-        var visited = Set<String>()
+        // Map to lightweight primitive structs
+        var compactList: [CompactVideoItem] = []
+        compactList.reserveCapacity(totalCount)
+        for (i, entry) in list.enumerated() {
+            compactList.append(
+                CompactVideoItem(
+                    originalIndex: i,
+                    duration: entry.fingerprint.duration,
+                    keyframeHash: entry.fingerprint.keyframeHash
+                )
+            )
+        }
+        
+        // Sort by duration for fast candidate pruning
+        let sorted = compactList.sorted { $0.duration < $1.duration }
+        
+        var visited = [Bool](repeating: false, count: totalCount)
         var duplicates: [DedupeGroup] = []
         var similars: [DedupeGroup] = []
         
         for i in 0..<sorted.count {
             let current = sorted[i]
-            let currentID = current.asset.localIdentifier
-            if visited.contains(currentID) { continue }
+            if visited[current.originalIndex] { continue }
             
-            var exactMatches: [PHAsset] = [current.asset]
-            var similarMatches: [PHAsset] = [current.asset]
+            var exactIndices: [Int] = [current.originalIndex]
+            var similarIndices: [Int] = [current.originalIndex]
             
             for j in (i + 1)..<sorted.count {
                 let candidate = sorted[j]
-                let candID = candidate.asset.localIdentifier
-                if visited.contains(candID) { continue }
+                if visited[candidate.originalIndex] { continue }
                 
-                let durationDiff = abs(candidate.fingerprint.duration - current.fingerprint.duration)
+                let durationDiff = candidate.duration - current.duration
                 if durationDiff > 3.0 {
                     // Videos differ by more than 3s; skip further comparisons in sorted array
                     break
                 }
                 
-                let dist = PhotoDedupeEngine.hammingDistance(current.fingerprint.keyframeHash, candidate.fingerprint.keyframeHash)
+                let dist = (current.keyframeHash ^ candidate.keyframeHash).nonzeroBitCount
                 
                 if durationDiff <= 0.2 && dist == 0 {
-                    exactMatches.append(candidate.asset)
-                    visited.insert(candID)
+                    exactIndices.append(candidate.originalIndex)
                 } else if durationDiff <= 2.0 && dist <= 8 {
-                    similarMatches.append(candidate.asset)
-                    visited.insert(candID)
+                    similarIndices.append(candidate.originalIndex)
                 }
             }
             
-            if exactMatches.count > 1 {
-                visited.insert(currentID)
-                let group = makeVideoGroup(from: exactMatches, kind: .exactDuplicate, sizeRecords: sizeRecords)
+            if exactIndices.count > 1 {
+                for idx in exactIndices { visited[idx] = true }
+                let groupAssets = exactIndices.map { list[$0].asset }
+                let group = makeVideoGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
                 duplicates.append(group)
-            } else if similarMatches.count > 1 {
-                visited.insert(currentID)
-                let group = makeVideoGroup(from: similarMatches, kind: .similar, sizeRecords: sizeRecords)
+            } else if similarIndices.count > 1 {
+                for idx in similarIndices { visited[idx] = true }
+                let groupAssets = similarIndices.map { list[$0].asset }
+                let group = makeVideoGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
                 similars.append(group)
+            }
+            
+            if i % 500 == 0 {
+                await Task.yield()
             }
         }
         

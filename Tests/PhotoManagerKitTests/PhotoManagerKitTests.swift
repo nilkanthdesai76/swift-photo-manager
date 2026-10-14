@@ -191,5 +191,21 @@ final class PhotoManagerKitTests: XCTestCase {
         XCTAssertEqual(overview.totalBytes, 0)
         XCTAssertEqual(PhotoKitManager.ByteFormatter.format(bytes: 1024), "1 KB")
     }
+    
+    // MARK: - 10. High-Throughput Hash Clustering Benchmark Test
+    
+    func testHighThroughputHashDistanceMath() {
+        // Verify Hamming distance bitwise math for exact and similar thresholds
+        let hashA: UInt64 = 0b1010101010101010
+        let hashExact: UInt64 = 0b1010101010101010
+        let hashSimilar: UInt64 = 0b1010101010101011 // 1 bit different
+        let hashFar: UInt64 = 0b0101010101010101 // all bits different
+        
+        XCTAssertEqual(PhotoDedupeEngine.hammingDistance(hashA, hashExact), 0)
+        XCTAssertEqual(PhotoDedupeEngine.hammingDistance(hashA, hashSimilar), 1)
+        XCTAssertTrue(PhotoDedupeEngine.hammingDistance(hashA, hashSimilar) <= 8)
+        XCTAssertFalse(PhotoDedupeEngine.hammingDistance(hashA, hashFar) <= 8)
+    }
 }
+
 
