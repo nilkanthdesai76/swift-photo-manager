@@ -213,11 +213,16 @@ public final class PhotoManagerCoordinator {
         }
     }
     
-    /// Starts the background pipeline sequentially to avoid Swift-concurrency starvation:
-    /// Phase 0: Exact KVC size resolution builds the reusable size index.
-    /// Phase 1: Photo deduplication (hashing + clustering).
-    /// Phase 2: Video deduplication (fingerprinting + clustering).
-    /// Phase 3: AI sorting.
+    /// Starts the fully concurrent background pipeline.
+    ///
+    /// The size fetch no longer blocks Swift executor threads (its Photos I/O is dispatched to GCD),
+    /// so it can run in parallel with photo hashing and video fingerprinting without starving them.
+    ///
+    /// Phase 0: Exact KVC size resolution builds the reusable size index (runs in background).
+    /// Phase 0.5: Photo hashing + video fingerprinting run concurrently with Phase 0.
+    /// Phase 1: Photo grouping starts as soon as photo hashing finishes.
+    /// Phase 2: Video grouping starts as soon as video fingerprinting finishes.
+    /// Phase 3: Blur album + AI sorting wait for the size index to complete.
     private func startBackgroundPipelines(cachedAICats: [String: String]) {
         let photos = self.allPhotos
         let videos = self.allVideos
@@ -227,7 +232,8 @@ public final class PhotoManagerCoordinator {
             guard let self = self else { return }
             
             // ==========================================
-            // PHASE 0: BUILD THE SIZE INDEX FIRST
+            // PHASE 0: SIZE INDEX (background, non-blocking)
+            // PHASE 0.5: PHOTO HASH + VIDEO FINGERPRINT (concurrent)
             // ==========================================
             await MainActor.run {
                 self.currentStep = .fetchingSizes
@@ -236,19 +242,48 @@ public final class PhotoManagerCoordinator {
             }
             
             let initialSizes = await MainActor.run { self.sizeRecords }
-            await self.runKvcSizeResolver(
+            
+            async let sizeResolverTask: Void = self.runKvcSizeResolver(
                 photos: photos,
                 videos: videos,
                 initialSizes: initialSizes,
                 cache: cacheRef
             )
             
-            if Task.isCancelled { return }
-            let sizeIndex = await MainActor.run { self.sizeRecords }
+            async let photoHashWarmTask: Void = PhotoDedupeEngine.warmPhotoHashCache(
+                assets: photos,
+                cache: cacheRef,
+                progressHandler: { [weak self] p in
+                    Task { @MainActor in
+                        self?.photoDedupeProgress = p
+                        if p.isScanning {
+                            self?.statusMessage = "Scanning photos (\(p.processed)/\(p.total))…"
+                        }
+                    }
+                }
+            )
+            
+            async let videoFingerprintWarmTask: Void = VideoDedupeEngine.warmVideoFingerprintCache(
+                videos: videos,
+                cache: cacheRef,
+                progressHandler: { [weak self] p in
+                    Task { @MainActor in
+                        self?.videoDedupeProgress = p
+                        if p.isScanning {
+                            self?.statusMessage = "Scanning videos (\(p.processed)/\(p.total))…"
+                        }
+                    }
+                }
+            )
             
             // ==========================================
-            // PHASE 1: PHOTO DEDUPE (hash + cluster with complete size index)
+            // PHASE 1: PHOTO GROUPING (starts as soon as photo hashing finishes)
             // ==========================================
+            await photoHashWarmTask
+            if Task.isCancelled { return }
+            
+            let partialSizes = await MainActor.run { self.sizeRecords }
+            
             await MainActor.run {
                 self.currentStep = .photoDedupe
                 self.statusMessage = "Scanning photo duplicates…"
@@ -257,7 +292,7 @@ public final class PhotoManagerCoordinator {
             let photoResults = await PhotoDedupeEngine.scanPhotoDedupe(
                 assets: photos,
                 cache: cacheRef,
-                sizeRecords: sizeIndex,
+                sizeRecords: partialSizes,
                 progressHandler: { [weak self] p in
                     Task { @MainActor in
                         self?.photoDedupeProgress = p
@@ -274,23 +309,23 @@ public final class PhotoManagerCoordinator {
                 self.photoDedupeProgress = .done
             }
             
-            // Build the Blurry Photos album from flags collected during hashing (reuses size index).
-            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
-            
+            // ==========================================
+            // PHASE 2: VIDEO GROUPING (starts as soon as video fingerprinting finishes)
+            // ==========================================
+            await videoFingerprintWarmTask
             if Task.isCancelled { return }
             
-            // ==========================================
-            // PHASE 2: SIMILAR & DUPLICATE FOR VIDEOS
-            // ==========================================
             await MainActor.run {
                 self.currentStep = .videoDedupe
                 self.statusMessage = "Scanning for duplicate videos…"
             }
             
+            let sizesForVideo = await MainActor.run { self.sizeRecords }
+            
             let videoResults = await VideoDedupeEngine.scanVideoDedupe(
                 videos: videos,
                 cache: cacheRef,
-                sizeRecords: sizeIndex,
+                sizeRecords: sizesForVideo,
                 progressHandler: { [weak self] p in
                     Task { @MainActor in
                         self?.videoDedupeProgress = p
@@ -304,10 +339,19 @@ public final class PhotoManagerCoordinator {
                 self.videoDedupeProgress = .done
             }
             
+            // ==========================================
+            // PHASE 3: WAIT FOR SIZE INDEX, THEN BLUR ALBUM + AI SORTING
+            // ==========================================
+            await sizeResolverTask
             if Task.isCancelled { return }
             
+            let sizeIndex = await MainActor.run { self.sizeRecords }
+            
+            // Build the Blurry Photos album with the complete size index for accurate totals.
+            await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizeIndex, cache: cacheRef)
+            
             // ==========================================
-            // PHASE 3: AI SORTING
+            // PHASE 3.5: AI SORTING
             // ==========================================
             await MainActor.run {
                 self.currentStep = .aiSorting
@@ -372,9 +416,10 @@ public final class PhotoManagerCoordinator {
         var processedCount = 0
         
         // Bounded pipeline: keep a fixed number of chunk tasks in flight at all times.
-        // Capping at 6 prevents starving the global concurrent executor with blocking Photos I/O,
-        // which was stalling the grouping tasks that run in parallel with size fetching.
-        let maxConcurrent = max(4, min(6, ProcessInfo.processInfo.processorCount))
+        // The per-asset size resolution is offloaded to GCD (`resolveExactSizeAsync`), so these
+        // tasks are lightweight suspended continuations that never block a Swift executor thread.
+        // That means we can run many in parallel without starving hashing/grouping tasks.
+        let maxConcurrent = max(8, min(16, ProcessInfo.processInfo.processorCount))
         let chunkStream = AsyncStream<[PHAsset]> { continuation in
             for chunk in chunks { continuation.yield(chunk) }
             continuation.finish()
@@ -389,7 +434,7 @@ public final class PhotoManagerCoordinator {
             videosBytes: Int64
         )
         
-        @Sendable func processChunk(_ chunk: [PHAsset]) -> ChunkResult {
+        @Sendable func processChunk(_ chunk: [PHAsset]) async -> ChunkResult {
             var batch: [String: AssetSizeRecord] = [:]
             batch.reserveCapacity(chunk.count)
             var photosBytes: Int64 = 0
@@ -397,20 +442,19 @@ public final class PhotoManagerCoordinator {
             var lpVideo: Int64 = 0
             var videosBytes: Int64 = 0
             
-            autoreleasepool {
-                for asset in chunk {
-                    if Task.isCancelled { break }
-                    let rec = StorageCalculator.resolveExactSize(for: asset)
-                    batch[asset.localIdentifier] = rec
-                    
-                    if asset.mediaType == .video {
-                        videosBytes += rec.totalBytes
-                    } else if asset.mediaSubtypes.contains(.photoLive) {
-                        lpStill += rec.stillBytes
-                        lpVideo += rec.videoBytes
-                    } else {
-                        photosBytes += rec.totalBytes
-                    }
+            for asset in chunk {
+                if Task.isCancelled { break }
+                // Non-blocking: the Photos I/O happens on a GCD worker thread.
+                let rec = await StorageCalculator.resolveExactSizeAsync(for: asset)
+                batch[asset.localIdentifier] = rec
+                
+                if asset.mediaType == .video {
+                    videosBytes += rec.totalBytes
+                } else if asset.mediaSubtypes.contains(.photoLive) {
+                    lpStill += rec.stillBytes
+                    lpVideo += rec.videoBytes
+                } else {
+                    photosBytes += rec.totalBytes
                 }
             }
             
@@ -428,9 +472,7 @@ public final class PhotoManagerCoordinator {
                     streamExhausted = true
                     return
                 }
-                // Run size fetching at .background priority so the parallel grouping tasks (.utility)
-                // always have threads available and never stall behind blocking Photos I/O.
-                group.addTask(priority: .background) { processChunk(chunk) }
+                group.addTask { await processChunk(chunk) }
                 inFlight += 1
             }
             

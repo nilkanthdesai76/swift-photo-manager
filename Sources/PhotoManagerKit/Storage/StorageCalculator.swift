@@ -134,6 +134,19 @@ public enum StorageCalculator {
         }
     }
     
+    /// Non-blocking variant of `resolveExactSize`.
+    ///
+    /// `PHAssetResource.assetResources(for:)` performs synchronous Photos I/O that blocks the calling
+    /// thread. Dispatching it to a GCD worker keeps Swift concurrency executor threads free, so the
+    /// size fetch can run at high concurrency without starving parallel hashing/grouping tasks.
+    public static func resolveExactSizeAsync(for asset: PHAsset) async -> AssetSizeRecord {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                continuation.resume(returning: resolveExactSize(for: asset))
+            }
+        }
+    }
+    
     /// Resolves KVC sizes for a batch of assets with autoreleasepool management.
     public static func resolveBatch(assets: [PHAsset]) -> [String: AssetSizeRecord] {
         var results: [String: AssetSizeRecord] = [:]
