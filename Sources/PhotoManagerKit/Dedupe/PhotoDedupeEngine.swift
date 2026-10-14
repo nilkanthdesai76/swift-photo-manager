@@ -40,7 +40,15 @@ public enum PhotoDedupeEngine {
         }
         
         // Fast Cluster into Duplicate & Similar Groups (< 50ms for 50k assets, < 5MB RAM)
-        let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords)
+        // Keep the card in "scanning" state while grouping so it never flips to "Clean" between hashing and results.
+        progressHandler?(
+            ScanProgress(
+                processed: totalCount,
+                total: totalCount,
+                isScanning: true
+            )
+        )
+        let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords, progressHandler: progressHandler)
         await cache.putPhotoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
         progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
         return clustered
@@ -273,7 +281,8 @@ public enum PhotoDedupeEngine {
     
     private static func clusterAssets(
         _ list: [(asset: PHAsset, hash: UInt64)],
-        sizeRecords: [String: AssetSizeRecord]
+        sizeRecords: [String: AssetSizeRecord],
+        progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         let totalCount = list.count
         guard totalCount > 1 else { return ([], []) }
@@ -357,8 +366,9 @@ public enum PhotoDedupeEngine {
         
         let similarTimeWindow: TimeInterval = 7200 // 2-hour temporal gating for burst/similar shots
         let maxLookahead = 150 // Memory-safe lookahead bound per anchor
+        let clusterTotal = unvisitedItems.count
         
-        for i in 0..<unvisitedItems.count {
+        for i in 0..<clusterTotal {
             let current = unvisitedItems[i]
             if visited[current.originalIndex] { continue }
             
@@ -393,6 +403,16 @@ public enum PhotoDedupeEngine {
             
             if i % 1000 == 0 {
                 await Task.yield()
+            }
+            
+            if i % 500 == 0, clusterTotal > 0 {
+                progressHandler?(
+                    ScanProgress(
+                        processed: list.count,
+                        total: list.count,
+                        isScanning: true
+                    )
+                )
             }
         }
         

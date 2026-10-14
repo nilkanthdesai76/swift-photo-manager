@@ -28,24 +28,66 @@ public enum VideoDedupeEngine {
         }
         
         let totalCount = videos.count
-        let cachedFingerprints = await cache.getAllVideoFingerprints()
+        let fingerprintMap = await fingerprintAndCacheVideos(videos: videos, cache: cache, progressHandler: progressHandler)
+        
         var videoRecords: [(asset: PHAsset, fingerprint: VideoFingerprintRecord)] = []
         videoRecords.reserveCapacity(totalCount)
+        for video in videos {
+            if let fp = fingerprintMap[video.localIdentifier] {
+                videoRecords.append((video, fp))
+            }
+        }
+        
+        // Cluster into Duplicate & Similar Groups
+        // Keep the card in "scanning" state while grouping so it never flips to "Clean" between fingerprinting and results.
+        progressHandler?(
+            ScanProgress(
+                processed: totalCount,
+                total: totalCount,
+                isScanning: true
+            )
+        )
+        let clustered = await clusterVideos(videoRecords, sizeRecords: sizeRecords, progressHandler: progressHandler)
+        await cache.putVideoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
+        progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
+        return clustered
+    }
+    
+    /// Warms the video fingerprint cache for all videos without clustering. Safe to run concurrently
+    /// with size fetching so that video fingerprinting wall-clock time overlaps the size index build.
+    public static func warmVideoFingerprintCache(
+        videos: [PHAsset],
+        cache: PhotoManagerCache = .shared,
+        progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
+    ) async {
+        guard !videos.isEmpty else { return }
+        _ = await fingerprintAndCacheVideos(videos: videos, cache: cache, progressHandler: progressHandler)
+    }
+    
+    /// Fingerprints every video that isn't already cached, persists the fingerprints, and returns a
+    /// complete ID→fingerprint map including previously cached entries.
+    private static func fingerprintAndCacheVideos(
+        videos: [PHAsset],
+        cache: PhotoManagerCache,
+        progressHandler: (@Sendable (ScanProgress) -> Void)?
+    ) async -> [String: VideoFingerprintRecord] {
+        let totalCount = videos.count
+        let cachedFingerprints = await cache.getAllVideoFingerprints()
+        var resultFingerprints = cachedFingerprints
+        resultFingerprints.reserveCapacity(totalCount)
         
         var uncachedVideos: [PHAsset] = []
         uncachedVideos.reserveCapacity(min(totalCount, 2000))
         
         // Step 1: Check in-memory fingerprint cache (< 2ms)
         for video in videos {
-            if let fp = cachedFingerprints[video.localIdentifier] {
-                videoRecords.append((video, fp))
-            } else {
+            if cachedFingerprints[video.localIdentifier] == nil {
                 uncachedVideos.append(video)
             }
         }
         
-        let alreadyProcessed = videoRecords.count
-        // Scan is underway (clustering included) even when every fingerprint was cached.
+        let alreadyProcessed = totalCount - uncachedVideos.count
+        // Scan is underway (clustering will follow in scanVideoDedupe).
         progressHandler?(
             ScanProgress(
                 processed: alreadyProcessed,
@@ -73,7 +115,7 @@ public enum VideoDedupeEngine {
                 if Task.isCancelled { break }
                 
                 let fp = await computeVideoFingerprint(for: video, manager: imageManager, options: requestOptions, targetSize: targetSize)
-                videoRecords.append((video, fp))
+                resultFingerprints[video.localIdentifier] = fp
                 batch[video.localIdentifier] = fp
                 currentProcessed += 1
                 
@@ -99,11 +141,7 @@ public enum VideoDedupeEngine {
             }
         }
         
-        // Step 3: Cluster into Duplicate & Similar Groups
-        let clustered = await clusterVideos(videoRecords, sizeRecords: sizeRecords)
-        await cache.putVideoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
-        progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
-        return clustered
+        return resultFingerprints
     }
     
     private static func computeVideoFingerprint(
@@ -150,7 +188,8 @@ public enum VideoDedupeEngine {
     
     private static func clusterVideos(
         _ list: [(asset: PHAsset, fingerprint: VideoFingerprintRecord)],
-        sizeRecords: [String: AssetSizeRecord]
+        sizeRecords: [String: AssetSizeRecord],
+        progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         let totalCount = list.count
         guard totalCount > 1 else { return ([], []) }
@@ -215,6 +254,16 @@ public enum VideoDedupeEngine {
             
             if i % 500 == 0 {
                 await Task.yield()
+            }
+            
+            if i % 250 == 0 {
+                progressHandler?(
+                    ScanProgress(
+                        processed: list.count,
+                        total: list.count,
+                        isScanning: true
+                    )
+                )
             }
         }
         
