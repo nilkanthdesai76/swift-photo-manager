@@ -58,6 +58,8 @@ public actor PhotoManagerCache {
     private var videoSimilars: [DedupeGroup] = []
     private var aiCategories: [String: String] = [:]
     private var blurryPhotoIDs: Set<String> = []
+    private var photoScanCompleted = false
+    private var videoScanCompleted = false
     
     private var isDirty = false
     private var didBootstrap = false
@@ -73,6 +75,8 @@ public actor PhotoManagerCache {
         var videoSimilars: [DedupeGroup]
         var aiCategories: [String: String]?
         var blurryPhotoIDs: [String]?
+        var photoScanCompleted: Bool?
+        var videoScanCompleted: Bool?
     }
     
     public init() {
@@ -99,6 +103,8 @@ public actor PhotoManagerCache {
             self.videoSimilars = env.videoSimilars
             self.aiCategories = env.aiCategories ?? [:]
             self.blurryPhotoIDs = Set(env.blurryPhotoIDs ?? [])
+            self.photoScanCompleted = env.photoScanCompleted ?? false
+            self.videoScanCompleted = env.videoScanCompleted ?? false
         }
     }
     
@@ -176,6 +182,7 @@ public actor PhotoManagerCache {
     public func putPhotoGroups(duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         self.photoDuplicates = duplicates
         self.photoSimilars = similars
+        self.photoScanCompleted = true
         isDirty = true
         scheduleDebouncedSave()
     }
@@ -183,8 +190,19 @@ public actor PhotoManagerCache {
     public func putVideoGroups(duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         self.videoDuplicates = duplicates
         self.videoSimilars = similars
+        self.videoScanCompleted = true
         isDirty = true
         scheduleDebouncedSave()
+    }
+    
+    /// True when a full photo scan (hash + cluster) has completed for the library.
+    public func isPhotoScanComplete() -> Bool {
+        photoScanCompleted
+    }
+    
+    /// True when a full video scan (fingerprint + cluster) has completed for the library.
+    public func isVideoScanComplete() -> Bool {
+        videoScanCompleted
     }
     
     // MARK: - AI Categories
@@ -235,7 +253,9 @@ public actor PhotoManagerCache {
             videoDuplicates: videoDuplicates,
             videoSimilars: videoSimilars,
             aiCategories: aiCategories,
-            blurryPhotoIDs: Array(blurryPhotoIDs)
+            blurryPhotoIDs: Array(blurryPhotoIDs),
+            photoScanCompleted: photoScanCompleted,
+            videoScanCompleted: videoScanCompleted
         )
         let url = fileURL
         
@@ -257,6 +277,8 @@ public actor PhotoManagerCache {
         videoSimilars.removeAll()
         aiCategories.removeAll()
         blurryPhotoIDs.removeAll()
+        photoScanCompleted = false
+        videoScanCompleted = false
         isDirty = false
         try? FileManager.default.removeItem(at: fileURL)
     }
@@ -266,12 +288,14 @@ public actor PhotoManagerCache {
     public func clearPhotoHashesAndBlur() {
         photoHashes.removeAll()
         blurryPhotoIDs.removeAll()
+        photoScanCompleted = false
         isDirty = true
         scheduleDebouncedSave()
     }
     
     public func clearVideoFingerprints() {
         videoFingerprints.removeAll()
+        videoScanCompleted = false
         isDirty = true
         scheduleDebouncedSave()
     }

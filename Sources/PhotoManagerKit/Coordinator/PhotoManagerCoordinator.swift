@@ -235,39 +235,59 @@ public final class PhotoManagerCoordinator {
                 self.currentStep = .photoDedupe
                 self.isIndexing = true
                 self.statusMessage = "Scanning photo duplicates…"
-                // Show both cards hashing from the very first moment so video starts visibly with photo.
-                self.photoDedupeProgress = ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Hashing")
-                self.videoDedupeProgress = ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Hashing")
             }
             
-            // Independent photo scan task: hashes + clusters.
-            let photoScanTask = Task<DedupeScanResult, Never>.detached(priority: .userInitiated) { [weak self] in
+            // Skip re-grouping on relaunch: if a full scan completed previously and every current
+            // asset is hashed, restored groups are already valid — no need to cluster again.
+            let photoScanComplete = await cacheRef.isPhotoScanComplete()
+            let photoHashCount = await cacheRef.getAllPhotoHashes().count
+            let videoScanComplete = await cacheRef.isVideoScanComplete()
+            let videoFingerprintCount = await cacheRef.getAllVideoFingerprints().count
+            let photoScanDone = photos.isEmpty || (photoScanComplete && photoHashCount >= photos.count)
+            let videoScanDone = videos.isEmpty || (videoScanComplete && videoFingerprintCount >= videos.count)
+            
+            await MainActor.run {
+                // Show both cards hashing from the very first moment so video starts visibly with photo.
+                self.photoDedupeProgress = photoScanDone
+                    ? .done
+                    : ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Hashing")
+                self.videoDedupeProgress = videoScanDone
+                    ? .done
+                    : ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Hashing")
+            }
+            
+            // Independent photo scan task: hashes + clusters (skipped when already complete).
+            let photoScanTask: Task<DedupeScanResult, Never>? = photoScanDone ? nil : Task.detached(priority: .userInitiated) { [weak self] in
                 guard let self = self else { return DedupeScanResult(duplicates: [], similars: []) }
                 return await self.runPhotoScan(assets: photos, cache: cacheRef)
             }
             
-            // Independent video scan task: fingerprints + clusters.
-            let videoScanTask = Task<DedupeScanResult, Never>.detached(priority: .userInitiated) { [weak self] in
+            // Independent video scan task: fingerprints + clusters (skipped when already complete).
+            let videoScanTask: Task<DedupeScanResult, Never>? = videoScanDone ? nil : Task.detached(priority: .userInitiated) { [weak self] in
                 guard let self = self else { return DedupeScanResult(duplicates: [], similars: []) }
                 return await self.runVideoScan(videos: videos, cache: cacheRef)
             }
             
             // Publish photo groups the moment the photo scan finishes.
-            let photoResults = await photoScanTask.value
-            if Task.isCancelled { return }
-            await MainActor.run {
-                self.photoDuplicates = photoResults.duplicates
-                self.photoSimilars = photoResults.similars
-                self.photoDedupeProgress = .done
+            if let photoScanTask = photoScanTask {
+                let photoResults = await photoScanTask.value
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.photoDuplicates = photoResults.duplicates
+                    self.photoSimilars = photoResults.similars
+                    self.photoDedupeProgress = .done
+                }
             }
             
             // Publish video groups the moment the video scan finishes.
-            let videoResults = await videoScanTask.value
-            if Task.isCancelled { return }
-            await MainActor.run {
-                self.videoDuplicates = videoResults.duplicates
-                self.videoSimilars = videoResults.similars
-                self.videoDedupeProgress = .done
+            if let videoScanTask = videoScanTask {
+                let videoResults = await videoScanTask.value
+                if Task.isCancelled { return }
+                await MainActor.run {
+                    self.videoDuplicates = videoResults.duplicates
+                    self.videoSimilars = videoResults.similars
+                    self.videoDedupeProgress = .done
+                }
             }
             
             // ==========================================
