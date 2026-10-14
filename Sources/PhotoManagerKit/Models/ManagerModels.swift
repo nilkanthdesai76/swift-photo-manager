@@ -197,11 +197,14 @@ public struct ScanProgress: Equatable, Sendable, Codable {
     public var processed: Int
     public var total: Int
     public var isScanning: Bool
+    /// Optional phase label, e.g. "Hashing" or "Grouping", shown by progress cards.
+    public var label: String?
     
-    public init(processed: Int = 0, total: Int = 0, isScanning: Bool = false) {
+    public init(processed: Int = 0, total: Int = 0, isScanning: Bool = false, label: String? = nil) {
         self.processed = processed
         self.total = total
         self.isScanning = isScanning
+        self.label = label
     }
     
     public static let idle = ScanProgress(processed: 0, total: 0, isScanning: false)

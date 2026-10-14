@@ -118,13 +118,13 @@ public struct DedupeProgressCardView: View {
                     }
                 }
                 
-                // In-Card Progress Bar if scanning
+                // In-Card Progress Bar if scanning — label reflects the current phase (Hashing / Grouping)
                 if progress.isScanning {
                     VStack(alignment: .leading, spacing: 4) {
                         ProgressView(value: progress.fraction)
                             .tint(accentColor)
                         HStack {
-                            Text("Hashing library assets…")
+                            Text(progress.label.map { "\($0) library assets…" } ?? "Hashing library assets…")
                                 .font(.system(size: 10))
                                 .foregroundColor(.secondary)
                             Spacer()

@@ -261,6 +261,52 @@ public actor PhotoManagerCache {
         try? FileManager.default.removeItem(at: fileURL)
     }
     
+    // MARK: - Targeted Clears (for the process dashboard)
+    
+    public func clearPhotoHashesAndBlur() {
+        photoHashes.removeAll()
+        blurryPhotoIDs.removeAll()
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func clearVideoFingerprints() {
+        videoFingerprints.removeAll()
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func clearSizes() {
+        sizes.removeAll()
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func clearAICategories() {
+        aiCategories.removeAll()
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    /// Snapshot of current cache contents for the process dashboard.
+    public func stats() -> (
+        sizes: Int,
+        photoHashes: Int,
+        videoFingerprints: Int,
+        aiCategories: Int,
+        blurryPhotos: Int,
+        groups: Int
+    ) {
+        (
+            sizes.count,
+            photoHashes.count,
+            videoFingerprints.count,
+            aiCategories.count,
+            blurryPhotoIDs.count,
+            photoDuplicates.count + photoSimilars.count + videoDuplicates.count + videoSimilars.count
+        )
+    }
+    
     private func scheduleDebouncedSave() {
         saveTask?.cancel()
         saveTask = Task { [weak self] in

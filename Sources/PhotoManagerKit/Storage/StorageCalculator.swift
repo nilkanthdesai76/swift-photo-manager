@@ -150,6 +150,51 @@ public enum StorageCalculator {
         }
     }
     
+    /// Resolves sizes for all assets missing from `existing`, concurrently on GCD workers.
+    /// Returns `existing` merged with the newly resolved records.
+    public static func resolveMissingSizes(
+        for assets: [PHAsset],
+        existing: [String: AssetSizeRecord],
+        maxConcurrent: Int = 8,
+        qos: DispatchQoS.QoSClass = .utility
+    ) async -> [String: AssetSizeRecord] {
+        var unique: [String: PHAsset] = [:]
+        unique.reserveCapacity(assets.count)
+        for asset in assets {
+            let id = asset.localIdentifier
+            if existing[id] == nil {
+                unique[id] = asset
+            }
+        }
+        guard !unique.isEmpty else { return existing }
+        
+        var result = existing
+        let missing = Array(unique.values)
+        let chunkSize = 50
+        let chunks: [[PHAsset]] = stride(from: 0, to: missing.count, by: chunkSize).map {
+            Array(missing[$0..<min($0 + chunkSize, missing.count)])
+        }
+        
+        await withTaskGroup(of: [String: AssetSizeRecord].self) { group in
+            for chunk in chunks {
+                group.addTask {
+                    var batch: [String: AssetSizeRecord] = [:]
+                    batch.reserveCapacity(chunk.count)
+                    for asset in chunk {
+                        if Task.isCancelled { break }
+                        batch[asset.localIdentifier] = await resolveExactSizeAsync(for: asset, qos: qos)
+                    }
+                    return batch
+                }
+            }
+            for await batch in group {
+                result.merge(batch) { _, new in new }
+            }
+        }
+        
+        return result
+    }
+    
     /// Resolves KVC sizes for a batch of assets with autoreleasepool management.
     public static func resolveBatch(assets: [PHAsset]) -> [String: AssetSizeRecord] {
         var results: [String: AssetSizeRecord] = [:]

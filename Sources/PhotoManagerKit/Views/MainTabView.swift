@@ -31,6 +31,13 @@ public struct MainTabView: View {
                     Label("AI & Timeline", systemImage: "sparkles.rectangle.stack.fill")
                 }
                 .tag(1)
+            
+            // Tab 3: Process Dashboard — cache stats, clear all, re-run individual processes
+            ProcessDashboardView(coordinator: coordinator)
+                .tabItem {
+                    Label("Processes", systemImage: "gearshape.arrow.triangle.2.circlepath")
+                }
+                .tag(2)
         }
         .task {
             await coordinator.start()

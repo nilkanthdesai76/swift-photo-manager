@@ -39,13 +39,14 @@ public enum PhotoDedupeEngine {
             }
         }
         
-        // Fast Cluster into Duplicate & Similar Groups (< 50ms for 50k assets, < 5MB RAM)
-        // Keep the card in "scanning" state while grouping so it never flips to "Clean" between hashing and results.
+        // Fast Cluster into Duplicate & Similar Groups
+        // Signal the grouping phase immediately so the card switches from "Hashing" to "Grouping".
         progressHandler?(
             ScanProgress(
                 processed: totalCount,
                 total: totalCount,
-                isScanning: true
+                isScanning: true,
+                label: "Grouping"
             )
         )
         let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords, progressHandler: progressHandler)
@@ -93,7 +94,8 @@ public enum PhotoDedupeEngine {
             ScanProgress(
                 processed: alreadyProcessed,
                 total: totalCount,
-                isScanning: true
+                isScanning: true,
+                label: "Hashing"
             )
         )
         
@@ -134,13 +136,14 @@ public enum PhotoDedupeEngine {
                 }
                 
                 if currentProcessed % 50 == 0 || currentProcessed == totalCount {
-                    // Keep isScanning=true: grouping follows immediately after warming, and the card
+                    // Keep isScanning=true: grouping follows immediately after hashing, and the card
                     // must not flip to "Clean" in between.
                     progressHandler?(
                         ScanProgress(
                             processed: currentProcessed,
                             total: totalCount,
-                            isScanning: true
+                            isScanning: true,
+                            label: "Hashing"
                         )
                     )
                 }
@@ -289,6 +292,17 @@ public enum PhotoDedupeEngine {
         let totalCount = list.count
         guard totalCount > 1 else { return ([], []) }
         
+        func emitGrouping(processed: Int) {
+            progressHandler?(
+                ScanProgress(
+                    processed: min(processed, totalCount),
+                    total: totalCount,
+                    isScanning: true,
+                    label: "Grouping"
+                )
+            )
+        }
+        
         // 1. Flatten into contiguous, cache-friendly primitive structs (Zero Obj-C calls in comparison loop)
         var compactItems: [CompactPhotoItem] = []
         compactItems.reserveCapacity(totalCount)
@@ -309,8 +323,9 @@ public enum PhotoDedupeEngine {
         }
         
         var visited = [Bool](repeating: false, count: totalCount)
-        var duplicates: [DedupeGroup] = []
-        var similars: [DedupeGroup] = []
+        // Raw group member lists collected during the hot loops; groups are built afterwards.
+        var rawExactGroups: [[PHAsset]] = []
+        var rawSimilarGroups: [[PHAsset]] = []
         
         // =========================================================================
         // PHASE 1: O(N) Exact Duplicates via Hash Table (Instantaneous for 50,000 items)
@@ -342,9 +357,7 @@ public enum PhotoDedupeEngine {
                 } else {
                     if currentGroup.count > 1 {
                         for cIdx in currentGroup { visited[cIdx] = true }
-                        let groupAssets = currentGroup.map { list[compactItems[$0].originalIndex].asset }
-                        let group = await makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
-                        duplicates.append(group)
+                        rawExactGroups.append(currentGroup.map { list[compactItems[$0].originalIndex].asset })
                     }
                     currentGroup = [candidateIdx]
                     baseTime = candTime
@@ -353,9 +366,7 @@ public enum PhotoDedupeEngine {
             
             if currentGroup.count > 1 {
                 for cIdx in currentGroup { visited[cIdx] = true }
-                let groupAssets = currentGroup.map { list[compactItems[$0].originalIndex].asset }
-                let group = await makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
-                duplicates.append(group)
+                rawExactGroups.append(currentGroup.map { list[compactItems[$0].originalIndex].asset })
             }
         }
         
@@ -398,26 +409,29 @@ public enum PhotoDedupeEngine {
                 for origIdx in clusterCompactIndices {
                     visited[origIdx] = true
                 }
-                let groupAssets = clusterCompactIndices.map { list[$0].asset }
-                let group = await makeGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
-                similars.append(group)
+                rawSimilarGroups.append(clusterCompactIndices.map { list[$0].asset })
             }
             
             if i % 1000 == 0 {
                 await Task.yield()
             }
             
-            // Emit a real fraction during grouping so the ring moves instead of sitting at 100%.
+            // Emit a real fraction during grouping so the ring moves with a visible percentage.
             if i % 500 == 0, clusterTotal > 0 {
-                progressHandler?(
-                    ScanProgress(
-                        processed: Int((Double(i) / Double(clusterTotal)) * Double(list.count)),
-                        total: list.count,
-                        isScanning: true
-                    )
-                )
+                emitGrouping(processed: Int((Double(i) / Double(clusterTotal)) * Double(totalCount)))
             }
         }
+        
+        // Resolve sizes for ALL group members concurrently — never block the cluster loops above.
+        let groupedAssets = (rawExactGroups + rawSimilarGroups).flatMap { $0 }
+        let resolvedSizes = await StorageCalculator.resolveMissingSizes(
+            for: groupedAssets,
+            existing: sizeRecords,
+            maxConcurrent: 8
+        )
+        
+        let duplicates = rawExactGroups.map { makeGroup(from: $0, kind: .exactDuplicate, sizeRecords: resolvedSizes) }
+        let similars = rawSimilarGroups.map { makeGroup(from: $0, kind: .similar, sizeRecords: resolvedSizes) }
         
         return (duplicates, similars)
     }
@@ -426,7 +440,7 @@ public enum PhotoDedupeEngine {
         from assets: [PHAsset],
         kind: DedupeMatchKind,
         sizeRecords: [String: AssetSizeRecord]
-    ) async -> DedupeGroup {
+    ) -> DedupeGroup {
         // Determine "Best" asset (favorites first, then largest pixel resolution)
         let sortedByQuality = assets.sorted { a, b in
             if a.isFavorite != b.isFavorite { return a.isFavorite }
@@ -436,34 +450,29 @@ public enum PhotoDedupeEngine {
         }
         let bestID = sortedByQuality.first?.localIdentifier ?? assets[0].localIdentifier
         
-        var items: [DedupeAssetItem] = []
-        items.reserveCapacity(assets.count)
-        for asset in assets {
-            // Non-blocking: missing sizes resolve on GCD workers and never stall clustering
-            // or fight the size-fetch trickle on an executor thread.
-            let record: AssetSizeRecord
-            if let cached = sizeRecords[asset.localIdentifier] {
-                record = cached
-            } else {
-                record = await StorageCalculator.resolveExactSizeAsync(for: asset)
-            }
+        let items: [DedupeAssetItem] = assets.map { asset in
+            let record = sizeRecords[asset.localIdentifier] ?? AssetSizeRecord(
+                totalBytes: 0,
+                stillBytes: 0,
+                videoBytes: 0,
+                isLivePhoto: false,
+                modificationDate: asset.modificationDate ?? asset.creationDate
+            )
             let isBest = asset.localIdentifier == bestID
             
-            items.append(
-                DedupeAssetItem(
-                    id: asset.localIdentifier,
-                    creationDate: asset.creationDate,
-                    pixelWidth: asset.pixelWidth,
-                    pixelHeight: asset.pixelHeight,
-                    duration: asset.duration,
-                    totalBytes: record.totalBytes,
-                    stillBytes: record.stillBytes,
-                    videoBytes: record.videoBytes,
-                    isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
-                    isVideo: false,
-                    isFavorite: asset.isFavorite,
-                    isSelectedForDeletion: !isBest // Auto-select redundant copies for deletion
-                )
+            return DedupeAssetItem(
+                id: asset.localIdentifier,
+                creationDate: asset.creationDate,
+                pixelWidth: asset.pixelWidth,
+                pixelHeight: asset.pixelHeight,
+                duration: asset.duration,
+                totalBytes: record.totalBytes,
+                stillBytes: record.stillBytes,
+                videoBytes: record.videoBytes,
+                isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
+                isVideo: false,
+                isFavorite: asset.isFavorite,
+                isSelectedForDeletion: !isBest // Auto-select redundant copies for deletion
             )
         }
         
@@ -474,5 +483,6 @@ public enum PhotoDedupeEngine {
             bestAssetID: bestID
         )
     }
+    
     #endif
 }

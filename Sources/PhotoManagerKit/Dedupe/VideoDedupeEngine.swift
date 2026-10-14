@@ -39,12 +39,13 @@ public enum VideoDedupeEngine {
         }
         
         // Cluster into Duplicate & Similar Groups
-        // Keep the card in "scanning" state while grouping so it never flips to "Clean" between fingerprinting and results.
+        // Signal the grouping phase immediately so the card switches from "Hashing" to "Grouping".
         progressHandler?(
             ScanProgress(
                 processed: totalCount,
                 total: totalCount,
-                isScanning: true
+                isScanning: true,
+                label: "Grouping"
             )
         )
         let clustered = await clusterVideos(videoRecords, sizeRecords: sizeRecords, progressHandler: progressHandler)
@@ -92,7 +93,8 @@ public enum VideoDedupeEngine {
             ScanProgress(
                 processed: alreadyProcessed,
                 total: totalCount,
-                isScanning: true
+                isScanning: true,
+                label: "Hashing"
             )
         )
         
@@ -126,13 +128,13 @@ public enum VideoDedupeEngine {
                 }
                 
                 if currentProcessed % 10 == 0 || currentProcessed == totalCount {
-                    // Keep isScanning=true: grouping follows immediately after warming, and the card
-                    // must not flip to "Clean" in between.
+                    // Keep isScanning=true: grouping follows immediately after fingerprinting.
                     progressHandler?(
                         ScanProgress(
                             processed: currentProcessed,
                             total: totalCount,
-                            isScanning: true
+                            isScanning: true,
+                            label: "Hashing"
                         )
                     )
                 }
@@ -196,6 +198,17 @@ public enum VideoDedupeEngine {
         let totalCount = list.count
         guard totalCount > 1 else { return ([], []) }
         
+        func emitGrouping(processed: Int) {
+            progressHandler?(
+                ScanProgress(
+                    processed: min(processed, totalCount),
+                    total: totalCount,
+                    isScanning: true,
+                    label: "Grouping"
+                )
+            )
+        }
+        
         // Map to lightweight primitive structs
         var compactList: [CompactVideoItem] = []
         compactList.reserveCapacity(totalCount)
@@ -213,8 +226,9 @@ public enum VideoDedupeEngine {
         let sorted = compactList.sorted { $0.duration < $1.duration }
         
         var visited = [Bool](repeating: false, count: totalCount)
-        var duplicates: [DedupeGroup] = []
-        var similars: [DedupeGroup] = []
+        // Raw group member lists collected during the hot loop; groups are built afterwards.
+        var rawExactGroups: [[PHAsset]] = []
+        var rawSimilarGroups: [[PHAsset]] = []
         
         for i in 0..<sorted.count {
             let current = sorted[i]
@@ -244,31 +258,32 @@ public enum VideoDedupeEngine {
             
             if exactIndices.count > 1 {
                 for idx in exactIndices { visited[idx] = true }
-                let groupAssets = exactIndices.map { list[$0].asset }
-                let group = await makeVideoGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
-                duplicates.append(group)
+                rawExactGroups.append(exactIndices.map { list[$0].asset })
             } else if similarIndices.count > 1 {
                 for idx in similarIndices { visited[idx] = true }
-                let groupAssets = similarIndices.map { list[$0].asset }
-                let group = await makeVideoGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
-                similars.append(group)
+                rawSimilarGroups.append(similarIndices.map { list[$0].asset })
             }
             
             if i % 500 == 0 {
                 await Task.yield()
             }
             
-            // Emit a real fraction during grouping so the ring moves instead of sitting at 100%.
+            // Emit a real fraction during grouping so the ring moves with a visible percentage.
             if i % 250 == 0, sorted.count > 0 {
-                progressHandler?(
-                    ScanProgress(
-                        processed: Int((Double(i) / Double(sorted.count)) * Double(list.count)),
-                        total: list.count,
-                        isScanning: true
-                    )
-                )
+                emitGrouping(processed: Int((Double(i) / Double(sorted.count)) * Double(totalCount)))
             }
         }
+        
+        // Resolve sizes for ALL group members concurrently — never block the cluster loop above.
+        let groupedAssets = (rawExactGroups + rawSimilarGroups).flatMap { $0 }
+        let resolvedSizes = await StorageCalculator.resolveMissingSizes(
+            for: groupedAssets,
+            existing: sizeRecords,
+            maxConcurrent: 8
+        )
+        
+        let duplicates = rawExactGroups.map { makeVideoGroup(from: $0, kind: .exactDuplicate, sizeRecords: resolvedSizes) }
+        let similars = rawSimilarGroups.map { makeVideoGroup(from: $0, kind: .similar, sizeRecords: resolvedSizes) }
         
         return (duplicates, similars)
     }
@@ -277,7 +292,7 @@ public enum VideoDedupeEngine {
         from videos: [PHAsset],
         kind: DedupeMatchKind,
         sizeRecords: [String: AssetSizeRecord]
-    ) async -> DedupeGroup {
+    ) -> DedupeGroup {
         let sortedByQuality = videos.sorted { a, b in
             if a.isFavorite != b.isFavorite { return a.isFavorite }
             let resA = a.pixelWidth * a.pixelHeight
@@ -286,34 +301,30 @@ public enum VideoDedupeEngine {
         }
         let bestID = sortedByQuality.first?.localIdentifier ?? videos[0].localIdentifier
         
-        var items: [DedupeAssetItem] = []
-        items.reserveCapacity(videos.count)
-        for asset in videos {
-            // Non-blocking: missing sizes resolve on GCD workers and never stall clustering.
-            let record: AssetSizeRecord
-            if let cached = sizeRecords[asset.localIdentifier] {
-                record = cached
-            } else {
-                record = await StorageCalculator.resolveExactSizeAsync(for: asset)
-            }
+        let items: [DedupeAssetItem] = videos.map { asset in
+            let record = sizeRecords[asset.localIdentifier] ?? AssetSizeRecord(
+                totalBytes: 0,
+                stillBytes: 0,
+                videoBytes: 0,
+                isLivePhoto: false,
+                modificationDate: asset.modificationDate ?? asset.creationDate
+            )
             let total = record.totalBytes
             let isBest = asset.localIdentifier == bestID
             
-            items.append(
-                DedupeAssetItem(
-                    id: asset.localIdentifier,
-                    creationDate: asset.creationDate,
-                    pixelWidth: asset.pixelWidth,
-                    pixelHeight: asset.pixelHeight,
-                    duration: asset.duration,
-                    totalBytes: total,
-                    stillBytes: 0,
-                    videoBytes: total,
-                    isLivePhoto: false,
-                    isVideo: true,
-                    isFavorite: asset.isFavorite,
-                    isSelectedForDeletion: !isBest
-                )
+            return DedupeAssetItem(
+                id: asset.localIdentifier,
+                creationDate: asset.creationDate,
+                pixelWidth: asset.pixelWidth,
+                pixelHeight: asset.pixelHeight,
+                duration: asset.duration,
+                totalBytes: total,
+                stillBytes: 0,
+                videoBytes: total,
+                isLivePhoto: false,
+                isVideo: true,
+                isFavorite: asset.isFavorite,
+                isSelectedForDeletion: !isBest
             )
         }
         
@@ -324,5 +335,6 @@ public enum VideoDedupeEngine {
             bestAssetID: bestID
         )
     }
+    
     #endif
 }

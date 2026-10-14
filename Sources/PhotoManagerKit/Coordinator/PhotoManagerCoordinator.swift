@@ -235,6 +235,9 @@ public final class PhotoManagerCoordinator {
                 self.currentStep = .photoDedupe
                 self.isIndexing = true
                 self.statusMessage = "Scanning photo duplicates…"
+                // Show both cards hashing from the very first moment so video starts visibly with photo.
+                self.photoDedupeProgress = ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Hashing")
+                self.videoDedupeProgress = ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Hashing")
             }
             
             // Independent photo scan task: hashes + clusters.
@@ -619,6 +622,102 @@ public final class PhotoManagerCoordinator {
                 self.aiCategories = updatedAICategories
             }
         }
+    }
+    
+    // MARK: - Process Dashboard Actions
+    
+    /// Clears every cache (this session and all previous sessions) and resets published state.
+    public func clearAllCaches() async {
+        await cache.clear()
+        photoDuplicates = []
+        photoSimilars = []
+        videoDuplicates = []
+        videoSimilars = []
+        sizeRecords = [:]
+        aiCategories = []
+        blurryPhotosAlbum = nil
+        photoDedupeProgress = .idle
+        videoDedupeProgress = .idle
+        sizeScanProgress = .idle
+        sizeScanResolvedBytes = 0
+    }
+    
+    /// Cache contents snapshot for the process dashboard.
+    public func cacheStats() async -> (
+        sizes: Int,
+        photoHashes: Int,
+        videoFingerprints: Int,
+        aiCategories: Int,
+        blurryPhotos: Int,
+        groups: Int
+    ) {
+        await cache.stats()
+    }
+    
+    /// Re-runs photo hashing + duplicate/similar clustering from scratch (clears photo hash & blur caches).
+    public func rerunPhotoDedupe() async {
+        guard !allPhotos.isEmpty else { return }
+        let photos = self.allPhotos
+        let cacheRef = self.cache
+        await cacheRef.clearPhotoHashesAndBlur()
+        photoDedupeProgress = ScanProgress(processed: 0, total: photos.count, isScanning: true, label: "Hashing")
+        blurryPhotosAlbum = nil
+        let result = await Task.detached(priority: .userInitiated) {
+            await self.runPhotoScan(assets: photos, cache: cacheRef)
+        }.value
+        photoDuplicates = result.duplicates
+        photoSimilars = result.similars
+        photoDedupeProgress = .done
+        await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: self.sizeRecords, cache: cacheRef)
+    }
+    
+    /// Re-runs video fingerprinting + duplicate/similar clustering from scratch.
+    public func rerunVideoDedupe() async {
+        guard !allVideos.isEmpty else { return }
+        let videos = self.allVideos
+        let cacheRef = self.cache
+        await cacheRef.clearVideoFingerprints()
+        videoDedupeProgress = ScanProgress(processed: 0, total: videos.count, isScanning: true, label: "Hashing")
+        let result = await Task.detached(priority: .userInitiated) {
+            await self.runVideoScan(videos: videos, cache: cacheRef)
+        }.value
+        videoDuplicates = result.duplicates
+        videoSimilars = result.similars
+        videoDedupeProgress = .done
+    }
+    
+    /// Re-runs the exact size fetch for all assets (clears the size index first).
+    public func rerunSizeFetch() async {
+        guard !allPhotos.isEmpty || !allVideos.isEmpty else { return }
+        let photos = self.allPhotos
+        let videos = self.allVideos
+        let cacheRef = self.cache
+        await cacheRef.clearSizes()
+        sizeScanResolvedBytes = 0
+        await Task.detached(priority: .utility) {
+            await self.runKvcSizeResolver(
+                photos: photos,
+                videos: videos,
+                initialSizes: [:],
+                cache: cacheRef,
+                maxConcurrent: max(8, min(16, ProcessInfo.processInfo.processorCount)),
+                qos: .utility
+            )
+        }.value
+        let sizes = await cacheRef.getAllSizes()
+        self.sizeRecords = sizes
+        await self.buildBlurryPhotosAlbum(photos: photos, sizeIndex: sizes, cache: cacheRef)
+    }
+    
+    /// Re-runs AI categorization from scratch (clears AI category cache first).
+    public func rerunAICategories() async {
+        guard !allPhotos.isEmpty else { return }
+        let photos = self.allPhotos
+        let cacheRef = self.cache
+        await cacheRef.clearAICategories()
+        await Task.detached(priority: .utility) {
+            await self.runAICategoryScanner(photos: photos, initialCache: [:], cache: cacheRef)
+        }.value
     }
     
     // MARK: - Deletion Action
