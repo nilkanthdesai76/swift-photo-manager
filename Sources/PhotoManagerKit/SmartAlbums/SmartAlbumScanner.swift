@@ -24,38 +24,40 @@ public enum SmartAlbumScanner {
         ]
         
         for (subtype, title, icon, color) in subtypes {
-            let collections = PHAssetCollection.fetchAssetCollections(
-                with: .smartAlbum,
-                subtype: subtype,
-                options: nil
-            )
-            
-            if let col = collections.firstObject {
-                let assets = PHAsset.fetchAssets(in: col, options: nil)
-                guard assets.count > 0 else { continue }
-                
-                var assetIDs: [String] = []
-                assetIDs.reserveCapacity(assets.count)
-                var totalBytes: Int64 = 0
-                
-                assets.enumerateObjects { asset, _, _ in
-                    assetIDs.append(asset.localIdentifier)
-                    let size = sizeRecords[asset.localIdentifier]?.totalBytes ?? 2_500_000
-                    totalBytes += size
-                }
-                
-                items.append(
-                    SmartAlbumItem(
-                        id: col.localIdentifier,
-                        title: title,
-                        count: assets.count,
-                        totalBytes: totalBytes,
-                        sfSymbol: icon,
-                        accentColorName: color,
-                        assetIDs: assetIDs,
-                        newestAssetID: assetIDs.first
-                    )
+            autoreleasepool {
+                let collections = PHAssetCollection.fetchAssetCollections(
+                    with: .smartAlbum,
+                    subtype: subtype,
+                    options: nil
                 )
+                
+                if let col = collections.firstObject {
+                    let assets = PHAsset.fetchAssets(in: col, options: nil)
+                    guard assets.count > 0 else { return }
+                    
+                    var assetIDs: [String] = []
+                    assetIDs.reserveCapacity(assets.count)
+                    var totalBytes: Int64 = 0
+                    
+                    assets.enumerateObjects { asset, _, _ in
+                        assetIDs.append(asset.localIdentifier)
+                        let size = sizeRecords[asset.localIdentifier]?.totalBytes ?? 2_500_000
+                        totalBytes += size
+                    }
+                    
+                    items.append(
+                        SmartAlbumItem(
+                            id: col.localIdentifier,
+                            title: title,
+                            count: assets.count,
+                            totalBytes: totalBytes,
+                            sfSymbol: icon,
+                            accentColorName: color,
+                            assetIDs: assetIDs,
+                            newestAssetID: assetIDs.first
+                        )
+                    )
+                }
             }
         }
         

@@ -150,58 +150,60 @@ public final class PhotoManagerCoordinator {
         sizeRecords: [String: AssetSizeRecord],
         cachedAICategories: [String: String]
     ) -> LibrarySnapshot {
-        // Fetch all photos
-        let photoOptions = PHFetchOptions()
-        photoOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
-        photoOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        let photoFetch = PHAsset.fetchAssets(with: photoOptions)
-        
-        var photos: [PHAsset] = []
-        photos.reserveCapacity(photoFetch.count)
-        photoFetch.enumerateObjects { asset, _, _ in photos.append(asset) }
-        
-        // Fetch all videos
-        let videoOptions = PHFetchOptions()
-        videoOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
-        videoOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
-        let videoFetch = PHAsset.fetchAssets(with: videoOptions)
-        
-        var videos: [PHAsset] = []
-        videos.reserveCapacity(videoFetch.count)
-        videoFetch.enumerateObjects { asset, _, _ in videos.append(asset) }
-        
-        // Pure KVC Storage Overview
-        let kvcStorage = StorageCalculator.computeOverview(photos: photos, videos: videos, sizeRecords: sizeRecords)
-        
-        // Smart Albums & Thresholds
-        let photoAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: sizeRecords)
-        let videoAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: videos, sizeRecords: sizeRecords)
-        let largePhotos = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: sizeRecords)
-        let oldPhotos = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
-        let largeVideos = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
-        
-        // Timeline, cached AI Categories, and User Albums
-        let timeline = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
-        let aiCategories = TimelineAndAIScanner.buildAICategories(
-            photos: photos,
-            sizeRecords: sizeRecords,
-            cachedCategories: cachedAICategories
-        )
-        let userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: sizeRecords)
-        
-        return LibrarySnapshot(
-            photos: photos,
-            videos: videos,
-            storageOverview: kvcStorage,
-            photoSmartAlbums: photoAlbums,
-            videoSmartAlbums: videoAlbums,
-            largePhotosAlbum: largePhotos,
-            oldPhotosAlbum: oldPhotos,
-            largeVideosAlbum: largeVideos,
-            yearSections: timeline,
-            aiCategories: aiCategories,
-            userAlbums: userAlbums
-        )
+        return autoreleasepool {
+            // Fetch all photos
+            let photoOptions = PHFetchOptions()
+            photoOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.image.rawValue)
+            photoOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            let photoFetch = PHAsset.fetchAssets(with: photoOptions)
+            
+            var photos: [PHAsset] = []
+            photos.reserveCapacity(photoFetch.count)
+            photoFetch.enumerateObjects { asset, _, _ in photos.append(asset) }
+            
+            // Fetch all videos
+            let videoOptions = PHFetchOptions()
+            videoOptions.predicate = NSPredicate(format: "mediaType == %d", PHAssetMediaType.video.rawValue)
+            videoOptions.sortDescriptors = [NSSortDescriptor(key: "creationDate", ascending: false)]
+            let videoFetch = PHAsset.fetchAssets(with: videoOptions)
+            
+            var videos: [PHAsset] = []
+            videos.reserveCapacity(videoFetch.count)
+            videoFetch.enumerateObjects { asset, _, _ in videos.append(asset) }
+            
+            // Pure KVC Storage Overview
+            let kvcStorage = StorageCalculator.computeOverview(photos: photos, videos: videos, sizeRecords: sizeRecords)
+            
+            // Smart Albums & Thresholds
+            let photoAlbums = SmartAlbumScanner.fetchPhotoSmartAlbums(sizeRecords: sizeRecords)
+            let videoAlbums = SmartAlbumScanner.fetchVideoSmartAlbums(videos: videos, sizeRecords: sizeRecords)
+            let largePhotos = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: sizeRecords)
+            let oldPhotos = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
+            let largeVideos = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
+            
+            // Timeline, cached AI Categories, and User Albums
+            let timeline = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
+            let aiCategories = TimelineAndAIScanner.buildAICategories(
+                photos: photos,
+                sizeRecords: sizeRecords,
+                cachedCategories: cachedAICategories
+            )
+            let userAlbums = TimelineAndAIScanner.fetchUserAlbums(sizeRecords: sizeRecords)
+            
+            return LibrarySnapshot(
+                photos: photos,
+                videos: videos,
+                storageOverview: kvcStorage,
+                photoSmartAlbums: photoAlbums,
+                videoSmartAlbums: videoAlbums,
+                largePhotosAlbum: largePhotos,
+                oldPhotosAlbum: oldPhotos,
+                largeVideosAlbum: largeVideos,
+                yearSections: timeline,
+                aiCategories: aiCategories,
+                userAlbums: userAlbums
+            )
+        }
     }
     
     /// Starts background execution:
@@ -352,17 +354,19 @@ public final class PhotoManagerCoordinator {
             var batch: [String: AssetSizeRecord] = [:]
             batch.reserveCapacity(chunk.count)
             
-            for asset in chunk {
-                let rec = StorageCalculator.resolveExactSize(for: asset)
-                batch[asset.localIdentifier] = rec
-                
-                if asset.mediaType == .video {
-                    runningVideosBytes += rec.totalBytes
-                } else if asset.mediaSubtypes.contains(.photoLive) {
-                    runningLPStillBytes += rec.stillBytes
-                    runningLPVideoBytes += rec.videoBytes
-                } else {
-                    runningPhotosBytes += rec.totalBytes
+            autoreleasepool {
+                for asset in chunk {
+                    let rec = StorageCalculator.resolveExactSize(for: asset)
+                    batch[asset.localIdentifier] = rec
+                    
+                    if asset.mediaType == .video {
+                        runningVideosBytes += rec.totalBytes
+                    } else if asset.mediaSubtypes.contains(.photoLive) {
+                        runningLPStillBytes += rec.stillBytes
+                        runningLPVideoBytes += rec.videoBytes
+                    } else {
+                        runningPhotosBytes += rec.totalBytes
+                    }
                 }
             }
             
