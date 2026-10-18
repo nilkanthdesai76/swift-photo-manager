@@ -20,6 +20,7 @@ public enum PhotoDedupeEngine {
         assets: [PHAsset],
         cache: PhotoManagerCache = .shared,
         sizeRecords: [String: AssetSizeRecord] = [:],
+        preset: SimilarityPreset = .balanced,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         guard !assets.isEmpty else {
@@ -39,16 +40,22 @@ public enum PhotoDedupeEngine {
             }
         }
         
-        // Fast Cluster into Duplicate & Similar Groups (< 50ms for 50k assets, < 5MB RAM)
-        // Keep the card in "scanning" state while grouping so it never flips to "Clean" between hashing and results.
+        // Fast Cluster into Duplicate & Similar Groups
+        // Signal the grouping phase immediately so the card switches from "Hashing" to "Grouping".
         progressHandler?(
             ScanProgress(
                 processed: totalCount,
                 total: totalCount,
-                isScanning: true
+                isScanning: true,
+                label: "Grouping"
             )
         )
-        let clustered = await clusterAssets(assetHashes, sizeRecords: sizeRecords, progressHandler: progressHandler)
+        let clustered = await clusterAssets(
+            assetHashes,
+            sizeRecords: sizeRecords,
+            preset: preset,
+            progressHandler: progressHandler
+        )
         await cache.putPhotoGroups(duplicates: clustered.duplicates, similars: clustered.similars)
         progressHandler?(ScanProgress(processed: totalCount, total: totalCount, isScanning: false))
         return clustered
@@ -63,6 +70,77 @@ public enum PhotoDedupeEngine {
     ) async {
         guard !assets.isEmpty else { return }
         _ = await hashAndCachePhotos(assets: assets, cache: cache, progressHandler: progressHandler)
+    }
+    
+    /// One-time backfill for libraries that were hashed BEFORE blur detection existed:
+    /// requests the same 32x32 thumbnails and computes blur flags for every photo that
+    /// is not already flagged, without touching the hash cache.
+    public static func backfillBlurFlags(
+        assets: [PHAsset],
+        cache: PhotoManagerCache = .shared
+    ) async {
+        guard !assets.isEmpty else { return }
+        let alreadyFlagged = await cache.getBlurryPhotoIDs()
+        
+        let imageManager = PHImageManager.default()
+        let requestOptions = PHImageRequestOptions()
+        requestOptions.isSynchronous = true
+        requestOptions.resizeMode = .fast
+        requestOptions.deliveryMode = .fastFormat
+        requestOptions.isNetworkAccessAllowed = false
+        let targetSize = CGSize(width: 32, height: 32)
+        
+        var batchBlurry: [String] = []
+        batchBlurry.reserveCapacity(200)
+        
+        for asset in assets {
+            if Task.isCancelled { break }
+            let id = asset.localIdentifier
+            guard !alreadyFlagged.contains(id) else { continue }
+            
+            let isBlurry = await detectBlur(for: asset, manager: imageManager, options: requestOptions, targetSize: targetSize)
+            if isBlurry {
+                batchBlurry.append(id)
+            }
+            
+            if batchBlurry.count >= 200 {
+                await cache.putBlurryPhotoIDs(batchBlurry)
+                batchBlurry.removeAll(keepingCapacity: true)
+                await Task.yield()
+            }
+        }
+        
+        if !batchBlurry.isEmpty {
+            await cache.putBlurryPhotoIDs(batchBlurry)
+        }
+    }
+    
+    /// Renders a 32x32 thumbnail and runs the blur heuristic on it.
+    private static func detectBlur(
+        for asset: PHAsset,
+        manager: PHImageManager,
+        options: PHImageRequestOptions,
+        targetSize: CGSize
+    ) async -> Bool {
+        await withCheckedContinuation { continuation in
+            _ = autoreleasepool {
+                manager.requestImage(
+                    for: asset,
+                    targetSize: targetSize,
+                    contentMode: .aspectFill,
+                    options: options
+                ) { image, _ in
+                    #if canImport(UIKit)
+                    if let cgImage = image?.cgImage,
+                       let raw = sampleGrayBytes(from: cgImage, width: 9, height: 8) {
+                        continuation.resume(returning: isBlurryPhoto(raw, width: 9, height: 8))
+                        return
+                    }
+                    #endif
+                    continuation.resume(returning: false)
+                }
+            }
+        }
     }
     
     /// Hashes every photo that isn't already cached, persists the hashes (and blur flags), and
@@ -93,7 +171,8 @@ public enum PhotoDedupeEngine {
             ScanProgress(
                 processed: alreadyProcessed,
                 total: totalCount,
-                isScanning: true
+                isScanning: true,
+                label: "Hashing"
             )
         )
         
@@ -134,11 +213,14 @@ public enum PhotoDedupeEngine {
                 }
                 
                 if currentProcessed % 50 == 0 || currentProcessed == totalCount {
+                    // Keep isScanning=true: grouping follows immediately after hashing, and the card
+                    // must not flip to "Clean" in between.
                     progressHandler?(
                         ScanProgress(
                             processed: currentProcessed,
                             total: totalCount,
-                            isScanning: currentProcessed < totalCount
+                            isScanning: true,
+                            label: "Hashing"
                         )
                     )
                 }
@@ -282,10 +364,22 @@ public enum PhotoDedupeEngine {
     private static func clusterAssets(
         _ list: [(asset: PHAsset, hash: UInt64)],
         sizeRecords: [String: AssetSizeRecord],
+        preset: SimilarityPreset = .balanced,
         progressHandler: (@Sendable (ScanProgress) -> Void)? = nil
     ) async -> (duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         let totalCount = list.count
         guard totalCount > 1 else { return ([], []) }
+        
+        func emitGrouping(processed: Int) {
+            progressHandler?(
+                ScanProgress(
+                    processed: min(processed, totalCount),
+                    total: totalCount,
+                    isScanning: true,
+                    label: "Grouping"
+                )
+            )
+        }
         
         // 1. Flatten into contiguous, cache-friendly primitive structs (Zero Obj-C calls in comparison loop)
         var compactItems: [CompactPhotoItem] = []
@@ -307,8 +401,9 @@ public enum PhotoDedupeEngine {
         }
         
         var visited = [Bool](repeating: false, count: totalCount)
-        var duplicates: [DedupeGroup] = []
-        var similars: [DedupeGroup] = []
+        // Raw group member lists collected during the hot loops; groups are built afterwards.
+        var rawExactGroups: [[PHAsset]] = []
+        var rawSimilarGroups: [[PHAsset]] = []
         
         // =========================================================================
         // PHASE 1: O(N) Exact Duplicates via Hash Table (Instantaneous for 50,000 items)
@@ -340,9 +435,7 @@ public enum PhotoDedupeEngine {
                 } else {
                     if currentGroup.count > 1 {
                         for cIdx in currentGroup { visited[cIdx] = true }
-                        let groupAssets = currentGroup.map { list[compactItems[$0].originalIndex].asset }
-                        let group = makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
-                        duplicates.append(group)
+                        rawExactGroups.append(currentGroup.map { list[compactItems[$0].originalIndex].asset })
                     }
                     currentGroup = [candidateIdx]
                     baseTime = candTime
@@ -351,9 +444,7 @@ public enum PhotoDedupeEngine {
             
             if currentGroup.count > 1 {
                 for cIdx in currentGroup { visited[cIdx] = true }
-                let groupAssets = currentGroup.map { list[compactItems[$0].originalIndex].asset }
-                let group = makeGroup(from: groupAssets, kind: .exactDuplicate, sizeRecords: sizeRecords)
-                duplicates.append(group)
+                rawExactGroups.append(currentGroup.map { list[compactItems[$0].originalIndex].asset })
             }
         }
         
@@ -364,8 +455,9 @@ public enum PhotoDedupeEngine {
         let unvisitedItems = compactItems.filter { !visited[$0.originalIndex] }
             .sorted { $0.timestamp < $1.timestamp }
         
-        let similarTimeWindow: TimeInterval = 7200 // 2-hour temporal gating for burst/similar shots
-        let maxLookahead = 150 // Memory-safe lookahead bound per anchor
+        let similarTimeWindow: TimeInterval = preset.timeWindow
+        let maxLookahead = preset.maxLookahead
+        let hammingThreshold = preset.hammingThreshold
         let clusterTotal = unvisitedItems.count
         
         for i in 0..<clusterTotal {
@@ -387,7 +479,7 @@ public enum PhotoDedupeEngine {
                 
                 // Hardware-accelerated bitwise distance (single CPU instruction)
                 let dist = (current.hash ^ candidate.hash).nonzeroBitCount
-                if dist <= 8 {
+                if dist <= hammingThreshold {
                     clusterCompactIndices.append(candidate.originalIndex)
                 }
             }
@@ -396,25 +488,24 @@ public enum PhotoDedupeEngine {
                 for origIdx in clusterCompactIndices {
                     visited[origIdx] = true
                 }
-                let groupAssets = clusterCompactIndices.map { list[$0].asset }
-                let group = makeGroup(from: groupAssets, kind: .similar, sizeRecords: sizeRecords)
-                similars.append(group)
+                rawSimilarGroups.append(clusterCompactIndices.map { list[$0].asset })
             }
             
             if i % 1000 == 0 {
                 await Task.yield()
             }
             
+            // Emit a real fraction during grouping so the ring moves with a visible percentage.
             if i % 500 == 0, clusterTotal > 0 {
-                progressHandler?(
-                    ScanProgress(
-                        processed: list.count,
-                        total: list.count,
-                        isScanning: true
-                    )
-                )
+                emitGrouping(processed: Int((Double(i) / Double(clusterTotal)) * Double(totalCount)))
             }
         }
+        
+        // Grouping is purely hash/dimension based and must NOT wait on size I/O.
+        // Byte totals use whatever sizes are already indexed; the coordinator backfills
+        // the remaining totals from the size index once the size fetch completes.
+        let duplicates = rawExactGroups.map { makeGroup(from: $0, kind: .exactDuplicate, sizeRecords: sizeRecords) }
+        let similars = rawSimilarGroups.map { makeGroup(from: $0, kind: .similar, sizeRecords: sizeRecords) }
         
         return (duplicates, similars)
     }
@@ -434,10 +525,13 @@ public enum PhotoDedupeEngine {
         let bestID = sortedByQuality.first?.localIdentifier ?? assets[0].localIdentifier
         
         let items: [DedupeAssetItem] = assets.map { asset in
-            let record = sizeRecords[asset.localIdentifier] ?? StorageCalculator.resolveExactSize(for: asset)
-            let total = record.totalBytes
-            let still = record.stillBytes
-            let video = record.videoBytes
+            let record = sizeRecords[asset.localIdentifier] ?? AssetSizeRecord(
+                totalBytes: 0,
+                stillBytes: 0,
+                videoBytes: 0,
+                isLivePhoto: false,
+                modificationDate: asset.modificationDate ?? asset.creationDate
+            )
             let isBest = asset.localIdentifier == bestID
             
             return DedupeAssetItem(
@@ -446,9 +540,9 @@ public enum PhotoDedupeEngine {
                 pixelWidth: asset.pixelWidth,
                 pixelHeight: asset.pixelHeight,
                 duration: asset.duration,
-                totalBytes: total,
-                stillBytes: still,
-                videoBytes: video,
+                totalBytes: record.totalBytes,
+                stillBytes: record.stillBytes,
+                videoBytes: record.videoBytes,
                 isLivePhoto: asset.mediaSubtypes.contains(.photoLive),
                 isVideo: false,
                 isFavorite: asset.isFavorite,
@@ -463,5 +557,6 @@ public enum PhotoDedupeEngine {
             bestAssetID: bestID
         )
     }
+    
     #endif
 }

@@ -2,6 +2,8 @@ import XCTest
 @testable import PhotoManagerKit
 import PhotoKitManager
 
+import AlgorithmKit
+
 final class PhotoManagerKitTests: XCTestCase {
     
     // MARK: - 1. Byte Formatter Tests
@@ -205,6 +207,131 @@ final class PhotoManagerKitTests: XCTestCase {
         XCTAssertEqual(PhotoDedupeEngine.hammingDistance(hashA, hashSimilar), 1)
         XCTAssertTrue(PhotoDedupeEngine.hammingDistance(hashA, hashSimilar) <= 8)
         XCTAssertFalse(PhotoDedupeEngine.hammingDistance(hashA, hashFar) <= 8)
+    }
+    
+    // MARK: - 11. AssetSortOrder Smallest Option Tests
+    
+    func testAssetSortOrderSmallest() {
+        let smallest = AssetSortOrder.smallest
+        XCTAssertEqual(smallest.rawValue, "Smallest")
+        XCTAssertEqual(smallest.title, "Smallest")
+        XCTAssertEqual(smallest.sfSymbol, "arrow.up.circle")
+    }
+    
+    // MARK: - 12. Declarative MultiSort Tests
+    
+    func testDeclarativeMultiSortWithAlgorithmKit() {
+        struct MockAsset: Equatable {
+            let id: String
+            let bytes: Int64
+            let date: Date
+        }
+        
+        let d1 = Date(timeIntervalSince1970: 1000)
+        let d2 = Date(timeIntervalSince1970: 2000)
+        let d3 = Date(timeIntervalSince1970: 3000)
+        
+        let assets = [
+            MockAsset(id: "A", bytes: 500, date: d1),
+            MockAsset(id: "B", bytes: 1000, date: d2),
+            MockAsset(id: "C", bytes: 500, date: d3),
+            MockAsset(id: "D", bytes: 200, date: d1)
+        ]
+        
+        // Multi-sort: bytes ascending (smallest), then date descending (latest)
+        let sorted: [MockAsset] = assets.sorted(by: [
+            SortDescriptor<MockAsset>.ascending(\MockAsset.bytes),
+            SortDescriptor<MockAsset>.descending(\MockAsset.date)
+        ])
+        
+        // 200 bytes (D), then 500 bytes with later date (C), then 500 bytes with earlier date (A), then 1000 bytes (B)
+        XCTAssertEqual(sorted.map(\.id), ["D", "C", "A", "B"])
+    }
+    
+    // MARK: - 13. Top-K Heaviest Media Selection Tests
+    
+    func testTopKHeaviestMediaSelection() {
+        struct FileItem {
+            let id: String
+            let size: Int64
+        }
+        
+        let files = [
+            FileItem(id: "f1", size: 10),
+            FileItem(id: "f2", size: 500),
+            FileItem(id: "f3", size: 250),
+            FileItem(id: "f4", size: 900),
+            FileItem(id: "f5", size: 5),
+            FileItem(id: "f6", size: 750)
+        ]
+        
+        // Find top 3 heaviest in O(N log 3)
+        let top3 = files.top(3) { a, b in
+            a.size < b.size
+        }
+        
+        XCTAssertEqual(top3.count, 3)
+        XCTAssertEqual(top3.map(\.id), ["f4", "f6", "f2"])
+        XCTAssertEqual(top3.map(\.size), [900, 750, 500])
+    }
+    
+    // MARK: - 14. Fuzzy Search on Category and Album Titles
+    
+    func testFuzzySearchOnCategoriesAndAlbums() {
+        struct SearchableItem {
+            let id: String
+            let title: String
+        }
+        
+        let categories = [
+            SearchableItem(id: "1", title: "Screenshots"),
+            SearchableItem(id: "2", title: "Screen Recordings"),
+            SearchableItem(id: "3", title: "Receipts & Documents"),
+            SearchableItem(id: "4", title: "Architecture & Buildings"),
+            SearchableItem(id: "5", title: "Vehicles & Transport")
+        ]
+        
+        // Fuzzy search for "screen"
+        let screenResults = categories.fuzzySearch("screen", on: \.title).map(\.item)
+        XCTAssertEqual(screenResults.count, 2)
+        XCTAssertTrue(screenResults.contains(where: { $0.id == "1" }))
+        XCTAssertTrue(screenResults.contains(where: { $0.id == "2" }))
+        
+        // Fuzzy search for "rcpt" (non-contiguous characters in Receipts)
+        let fuzzyResults = categories.fuzzySearch("rcpt", on: \.title).map(\.item)
+        XCTAssertEqual(fuzzyResults.first?.id, "3")
+        
+        // Empty query returns all
+        let allResults = categories.fuzzySearch("", on: \.title).map(\.item)
+        XCTAssertEqual(allResults.count, 5)
+    }
+    
+    // MARK: - 15. Functional Bucketing & Order-Preserving Deduplication
+    
+    func testFunctionalBucketingAndUniqued() {
+        struct PhotoRef {
+            let id: String
+            let year: Int
+        }
+        
+        let photos = [
+            PhotoRef(id: "p1", year: 2024),
+            PhotoRef(id: "p2", year: 2023),
+            PhotoRef(id: "p3", year: 2024),
+            PhotoRef(id: "p4", year: 2022),
+            PhotoRef(id: "p5", year: 2023)
+        ]
+        
+        // Group by year via AlgorithmKit
+        let grouped = photos.grouped(by: \.year)
+        XCTAssertEqual(grouped[2024]?.map(\.id), ["p1", "p3"])
+        XCTAssertEqual(grouped[2023]?.map(\.id), ["p2", "p5"])
+        XCTAssertEqual(grouped[2022]?.map(\.id), ["p4"])
+        
+        // Order-preserving deduplication via uniqued()
+        let duplicateIDs = ["p1", "p2", "p1", "p3", "p2", "p4", "p1"]
+        let uniqueIDs = duplicateIDs.uniqued()
+        XCTAssertEqual(uniqueIDs, ["p1", "p2", "p3", "p4"])
     }
 }
 

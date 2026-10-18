@@ -58,6 +58,9 @@ public actor PhotoManagerCache {
     private var videoSimilars: [DedupeGroup] = []
     private var aiCategories: [String: String] = [:]
     private var blurryPhotoIDs: Set<String> = []
+    private var photoScanCompleted = false
+    private var videoScanCompleted = false
+    private var blurScanCompleted = false
     
     private var isDirty = false
     private var didBootstrap = false
@@ -73,6 +76,9 @@ public actor PhotoManagerCache {
         var videoSimilars: [DedupeGroup]
         var aiCategories: [String: String]?
         var blurryPhotoIDs: [String]?
+        var photoScanCompleted: Bool?
+        var videoScanCompleted: Bool?
+        var blurScanCompleted: Bool?
     }
     
     public init() {
@@ -99,6 +105,9 @@ public actor PhotoManagerCache {
             self.videoSimilars = env.videoSimilars
             self.aiCategories = env.aiCategories ?? [:]
             self.blurryPhotoIDs = Set(env.blurryPhotoIDs ?? [])
+            self.photoScanCompleted = env.photoScanCompleted ?? false
+            self.videoScanCompleted = env.videoScanCompleted ?? false
+            self.blurScanCompleted = env.blurScanCompleted ?? false
         }
     }
     
@@ -176,6 +185,9 @@ public actor PhotoManagerCache {
     public func putPhotoGroups(duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         self.photoDuplicates = duplicates
         self.photoSimilars = similars
+        self.photoScanCompleted = true
+        // A full photo scan also detects blur for every uncached asset it hashes.
+        self.blurScanCompleted = true
         isDirty = true
         scheduleDebouncedSave()
     }
@@ -183,8 +195,30 @@ public actor PhotoManagerCache {
     public func putVideoGroups(duplicates: [DedupeGroup], similars: [DedupeGroup]) {
         self.videoDuplicates = duplicates
         self.videoSimilars = similars
+        self.videoScanCompleted = true
         isDirty = true
         scheduleDebouncedSave()
+    }
+    
+    /// True when a full photo scan (hash + cluster) has completed for the library.
+    public func isPhotoScanComplete() -> Bool {
+        photoScanCompleted
+    }
+    
+    /// True when every photo has passed through blur detection (via scan or backfill).
+    public func isBlurScanComplete() -> Bool {
+        blurScanCompleted
+    }
+    
+    public func markBlurScanComplete() {
+        blurScanCompleted = true
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    /// True when a full video scan (fingerprint + cluster) has completed for the library.
+    public func isVideoScanComplete() -> Bool {
+        videoScanCompleted
     }
     
     // MARK: - AI Categories
@@ -235,7 +269,10 @@ public actor PhotoManagerCache {
             videoDuplicates: videoDuplicates,
             videoSimilars: videoSimilars,
             aiCategories: aiCategories,
-            blurryPhotoIDs: Array(blurryPhotoIDs)
+            blurryPhotoIDs: Array(blurryPhotoIDs),
+            photoScanCompleted: photoScanCompleted,
+            videoScanCompleted: videoScanCompleted,
+            blurScanCompleted: blurScanCompleted
         )
         let url = fileURL
         
@@ -257,8 +294,73 @@ public actor PhotoManagerCache {
         videoSimilars.removeAll()
         aiCategories.removeAll()
         blurryPhotoIDs.removeAll()
+        photoScanCompleted = false
+        videoScanCompleted = false
+        blurScanCompleted = false
         isDirty = false
         try? FileManager.default.removeItem(at: fileURL)
+    }
+    
+    // MARK: - Targeted Clears (for the process dashboard)
+    
+    public func clearPhotoHashesAndBlur() {
+        photoHashes.removeAll()
+        blurryPhotoIDs.removeAll()
+        photoScanCompleted = false
+        blurScanCompleted = false
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func clearVideoFingerprints() {
+        videoFingerprints.removeAll()
+        videoScanCompleted = false
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func clearSizes() {
+        sizes.removeAll()
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    public func clearAICategories() {
+        aiCategories.removeAll()
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    /// Clears only the clustered groups + scan-complete flags, keeping hashes/fingerprints.
+    /// Used by "Re-group only" — the re-scan then skips hashing and re-runs just the clustering.
+    public func clearGroups() {
+        photoDuplicates.removeAll()
+        photoSimilars.removeAll()
+        videoDuplicates.removeAll()
+        videoSimilars.removeAll()
+        photoScanCompleted = false
+        videoScanCompleted = false
+        isDirty = true
+        scheduleDebouncedSave()
+    }
+    
+    /// Snapshot of current cache contents for the process dashboard.
+    public func stats() -> (
+        sizes: Int,
+        photoHashes: Int,
+        videoFingerprints: Int,
+        aiCategories: Int,
+        blurryPhotos: Int,
+        groups: Int
+    ) {
+        (
+            sizes.count,
+            photoHashes.count,
+            videoFingerprints.count,
+            aiCategories.count,
+            blurryPhotoIDs.count,
+            photoDuplicates.count + photoSimilars.count + videoDuplicates.count + videoSimilars.count
+        )
     }
     
     private func scheduleDebouncedSave() {

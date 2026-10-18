@@ -1,4 +1,5 @@
 import Foundation
+import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -212,6 +213,42 @@ public enum SmartAlbumScanner {
             accentColorName: "red",
             assetIDs: matchedIDs,
             newestAssetID: matchedIDs.first
+        )
+    }
+    
+    /// Selects the top `limit` heaviest media items (photos and videos) using AlgorithmKit's bounded min-heap in O(N log K).
+    public static func fetchTopHeaviestMedia(
+        photos: [PHAsset],
+        videos: [PHAsset],
+        sizeRecords: [String: AssetSizeRecord] = [:],
+        limit: Int = 50
+    ) -> SmartAlbumItem? {
+        let allMedia = photos + videos
+        guard !allMedia.isEmpty else { return nil }
+        
+        let heaviest = allMedia.top(limit) { a, b in
+            let bA = sizeRecords[a.localIdentifier]?.totalBytes ?? 0
+            let bB = sizeRecords[b.localIdentifier]?.totalBytes ?? 0
+            if bA != bB { return bA < bB }
+            return a.localIdentifier < b.localIdentifier
+        }
+        
+        guard let first = heaviest.first, (sizeRecords[first.localIdentifier]?.totalBytes ?? 0) > 0 else {
+            return nil
+        }
+        
+        let ids = heaviest.map(\.localIdentifier)
+        let totalBytes = ids.reduce(0) { $0 + (sizeRecords[$1]?.totalBytes ?? 0) }
+        
+        return SmartAlbumItem(
+            id: "top_heaviest",
+            title: "Top Heaviest Media (\(ids.count))",
+            count: ids.count,
+            totalBytes: totalBytes,
+            sfSymbol: "scalemass.fill",
+            accentColorName: "red",
+            assetIDs: ids,
+            newestAssetID: ids.first
         )
     }
     #endif

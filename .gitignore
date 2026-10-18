@@ -7,6 +7,7 @@ DerivedData/
 *.xcworkspace
 *.xcuserdatad/
 .swiftpm/
+Package.resolved
 
 # Local Demo & Development Scripts (kept locally, not published with SPM package)
 Demo/

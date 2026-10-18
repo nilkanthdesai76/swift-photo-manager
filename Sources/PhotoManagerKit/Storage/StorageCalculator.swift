@@ -134,6 +134,73 @@ public enum StorageCalculator {
         }
     }
     
+    /// Non-blocking variant of `resolveExactSize`.
+    ///
+    /// `PHAssetResource.assetResources(for:)` performs synchronous Photos I/O that blocks the calling
+    /// thread. Dispatching it to a GCD worker keeps Swift concurrency executor threads free, so the
+    /// size fetch can run at high concurrency without starving parallel hashing/grouping tasks.
+    public static func resolveExactSizeAsync(
+        for asset: PHAsset,
+        qos: DispatchQoS.QoSClass = .utility
+    ) async -> AssetSizeRecord {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: qos).async {
+                continuation.resume(returning: resolveExactSize(for: asset))
+            }
+        }
+    }
+    
+    /// Resolves sizes for all assets missing from `existing`, concurrently on GCD workers.
+    /// Returns `existing` merged with the newly resolved records.
+    /// `progressHandler` reports (resolvedCount, totalMissing) as chunks complete.
+    public static func resolveMissingSizes(
+        for assets: [PHAsset],
+        existing: [String: AssetSizeRecord],
+        maxConcurrent: Int = 16,
+        qos: DispatchQoS.QoSClass = .utility,
+        progressHandler: (@Sendable (Int, Int) -> Void)? = nil
+    ) async -> [String: AssetSizeRecord] {
+        var unique: [String: PHAsset] = [:]
+        unique.reserveCapacity(assets.count)
+        for asset in assets {
+            let id = asset.localIdentifier
+            if existing[id] == nil {
+                unique[id] = asset
+            }
+        }
+        guard !unique.isEmpty else { return existing }
+        
+        var result = existing
+        let missing = Array(unique.values)
+        let chunkSize = 50
+        let chunks: [[PHAsset]] = stride(from: 0, to: missing.count, by: chunkSize).map {
+            Array(missing[$0..<min($0 + chunkSize, missing.count)])
+        }
+        let missingTotal = missing.count
+        var resolvedCount = 0
+        
+        await withTaskGroup(of: [String: AssetSizeRecord].self) { group in
+            for chunk in chunks {
+                group.addTask {
+                    var batch: [String: AssetSizeRecord] = [:]
+                    batch.reserveCapacity(chunk.count)
+                    for asset in chunk {
+                        if Task.isCancelled { break }
+                        batch[asset.localIdentifier] = await resolveExactSizeAsync(for: asset, qos: qos)
+                    }
+                    return batch
+                }
+            }
+            for await batch in group {
+                result.merge(batch) { _, new in new }
+                resolvedCount += batch.count
+                progressHandler?(min(resolvedCount, missingTotal), missingTotal)
+            }
+        }
+        
+        return result
+    }
+    
     /// Resolves KVC sizes for a batch of assets with autoreleasepool management.
     public static func resolveBatch(assets: [PHAsset]) -> [String: AssetSizeRecord] {
         var results: [String: AssetSizeRecord] = [:]

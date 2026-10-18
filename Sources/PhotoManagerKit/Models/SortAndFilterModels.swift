@@ -5,14 +5,17 @@ public enum AssetSortOrder: String, CaseIterable, Identifiable, Sendable {
     case latest = "Latest"
     case oldest = "Oldest"
     case largest = "Largest"
+    case smallest = "Smallest"
     
     public var id: String { rawValue }
+    public var title: String { rawValue }
     
     public var sfSymbol: String {
         switch self {
         case .latest: return "arrow.down"
         case .oldest: return "arrow.up"
         case .largest: return "arrow.down.circle"
+        case .smallest: return "arrow.up.circle"
         }
     }
 }
