@@ -1,5 +1,6 @@
 import Foundation
 import Observation
+import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -15,6 +16,7 @@ public struct LibrarySnapshot: Sendable {
     public let largePhotosAlbum: SmartAlbumItem?
     public let oldPhotosAlbum: SmartAlbumItem?
     public let largeVideosAlbum: SmartAlbumItem?
+    public let topHeaviestAlbum: SmartAlbumItem?
     public let yearSections: [YearSection]
     public let aiCategories: [AICategoryItem]
     public let userAlbums: [UserAlbumItem]
@@ -60,6 +62,7 @@ public final class PhotoManagerCoordinator {
     public var videoDedupeProgress: ScanProgress = .idle
     public var videoSmartAlbums: [SmartAlbumItem] = []
     public var largeVideosAlbum: SmartAlbumItem?
+    public var topHeaviestAlbum: SmartAlbumItem?
     
     // Blur detection (populated from the photo hashing pass)
     public var blurryPhotosAlbum: SmartAlbumItem?
@@ -161,6 +164,7 @@ public final class PhotoManagerCoordinator {
         self.largePhotosAlbum = snapshot.largePhotosAlbum
         self.oldPhotosAlbum = snapshot.oldPhotosAlbum
         self.largeVideosAlbum = snapshot.largeVideosAlbum
+        self.topHeaviestAlbum = snapshot.topHeaviestAlbum
         self.yearSections = snapshot.yearSections
         self.aiCategories = snapshot.aiCategories
         self.userAlbums = snapshot.userAlbums
@@ -204,6 +208,12 @@ public final class PhotoManagerCoordinator {
             let largePhotos = SmartAlbumScanner.filterLargePhotos(photos: photos, sizeRecords: sizeRecords)
             let oldPhotos = SmartAlbumScanner.filterOldPhotos(photos: photos, sizeRecords: sizeRecords)
             let largeVideos = SmartAlbumScanner.filterLargeVideos(videos: videos, sizeRecords: sizeRecords)
+            let topHeaviest = SmartAlbumScanner.fetchTopHeaviestMedia(
+                photos: photos,
+                videos: videos,
+                sizeRecords: sizeRecords,
+                limit: 50
+            )
             
             // Timeline, cached AI Categories, and User Albums
             let timeline = TimelineAndAIScanner.buildTimeline(photos: photos, sizeRecords: sizeRecords)
@@ -223,6 +233,7 @@ public final class PhotoManagerCoordinator {
                 largePhotosAlbum: largePhotos,
                 oldPhotosAlbum: oldPhotos,
                 largeVideosAlbum: largeVideos,
+                topHeaviestAlbum: topHeaviest,
                 yearSections: timeline,
                 aiCategories: aiCategories,
                 userAlbums: userAlbums
@@ -892,10 +903,11 @@ public final class PhotoManagerCoordinator {
     
     /// Safely deletes selected assets via native PhotoKit confirmation sheet.
     public func deleteAssets(withIDs ids: [String]) async -> Bool {
-        guard !ids.isEmpty else { return true }
+        let uniqueIDs = ids.uniqued()
+        guard !uniqueIDs.isEmpty else { return true }
         
         let fetchOptions = PHFetchOptions()
-        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: ids, options: fetchOptions)
+        let fetched = PHAsset.fetchAssets(withLocalIdentifiers: uniqueIDs, options: fetchOptions)
         guard fetched.count > 0 else { return false }
         
         do {
@@ -904,7 +916,7 @@ public final class PhotoManagerCoordinator {
             }
             
             // Remove from local memory lists
-            let deletedSet = Set(ids)
+            let deletedSet = Set(uniqueIDs)
             self.allPhotos.removeAll { deletedSet.contains($0.localIdentifier) }
             self.allVideos.removeAll { deletedSet.contains($0.localIdentifier) }
             
@@ -920,6 +932,14 @@ public final class PhotoManagerCoordinator {
                 blur.count = blur.assetIDs.count
                 blur.totalBytes = blur.assetIDs.reduce(Int64(0)) { $0 + (self.sizeRecords[$1]?.totalBytes ?? 0) }
                 self.blurryPhotosAlbum = blur.assetIDs.isEmpty ? nil : blur
+            }
+            
+            // Prune deleted assets from the top heaviest album
+            if var heaviest = self.topHeaviestAlbum {
+                heaviest.assetIDs.removeAll { deletedSet.contains($0) }
+                heaviest.count = heaviest.assetIDs.count
+                heaviest.totalBytes = heaviest.assetIDs.reduce(Int64(0)) { $0 + (self.sizeRecords[$1]?.totalBytes ?? 0) }
+                self.topHeaviestAlbum = heaviest.assetIDs.isEmpty ? nil : heaviest
             }
             
             // Recalculate smart albums & overview in background

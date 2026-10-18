@@ -1,4 +1,5 @@
 import SwiftUI
+import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -32,28 +33,77 @@ public struct MonthPhotoListView: View {
     }
     
     private var displayedAssetIDs: [String] {
-        month.assetIDs.sorted { id1, id2 in
-            switch selectedSort {
-            case .latest:
-                let d1 = assetCreationDates[id1] ?? Date.distantPast
-                let d2 = assetCreationDates[id2] ?? Date.distantPast
-                if d1 != d2 { return d1 > d2 }
-                return id1 < id2
-                
-            case .oldest:
-                let d1 = assetCreationDates[id1] ?? Date.distantFuture
-                let d2 = assetCreationDates[id2] ?? Date.distantFuture
-                if d1 != d2 { return d1 < d2 }
-                return id1 < id2
-                
-            case .largest:
-                let b1 = sizeRecords[id1]?.totalBytes ?? 0
-                let b2 = sizeRecords[id2]?.totalBytes ?? 0
-                if b1 != b2 { return b1 > b2 }
-                let d1 = assetCreationDates[id1] ?? Date.distantPast
-                let d2 = assetCreationDates[id2] ?? Date.distantPast
-                return d1 > d2
-            }
+        let dates = assetCreationDates
+        let sizes = sizeRecords
+        
+        switch selectedSort {
+        case .latest:
+            return month.assetIDs.sorted(by: [
+                SortDescriptor { a, b in
+                    let d1 = dates[a] ?? Date.distantPast
+                    let d2 = dates[b] ?? Date.distantPast
+                    if d1 > d2 { return .orderedAscending }
+                    if d1 < d2 { return .orderedDescending }
+                    return .orderedSame
+                },
+                SortDescriptor { a, b in
+                    if a < b { return .orderedAscending }
+                    if a > b { return .orderedDescending }
+                    return .orderedSame
+                }
+            ])
+            
+        case .oldest:
+            return month.assetIDs.sorted(by: [
+                SortDescriptor { a, b in
+                    let d1 = dates[a] ?? Date.distantFuture
+                    let d2 = dates[b] ?? Date.distantFuture
+                    if d1 < d2 { return .orderedAscending }
+                    if d1 > d2 { return .orderedDescending }
+                    return .orderedSame
+                },
+                SortDescriptor { a, b in
+                    if a < b { return .orderedAscending }
+                    if a > b { return .orderedDescending }
+                    return .orderedSame
+                }
+            ])
+            
+        case .largest:
+            return month.assetIDs.sorted(by: [
+                SortDescriptor { a, b in
+                    let b1 = sizes[a]?.totalBytes ?? 0
+                    let b2 = sizes[b]?.totalBytes ?? 0
+                    if b1 > b2 { return .orderedAscending }
+                    if b1 < b2 { return .orderedDescending }
+                    return .orderedSame
+                },
+                SortDescriptor { a, b in
+                    let d1 = dates[a] ?? Date.distantPast
+                    let d2 = dates[b] ?? Date.distantPast
+                    if d1 > d2 { return .orderedAscending }
+                    if d1 < d2 { return .orderedDescending }
+                    return .orderedSame
+                }
+            ])
+            
+        case .smallest:
+            return month.assetIDs.sorted(by: [
+                SortDescriptor { a, b in
+                    let b1 = sizes[a]?.totalBytes ?? 0
+                    let b2 = sizes[b]?.totalBytes ?? 0
+                    if b1 < b2 { return .orderedAscending }
+                    if b1 > b2 { return .orderedDescending }
+                    return .orderedSame
+                },
+                SortDescriptor { a, b in
+                    let d1 = dates[a] ?? Date.distantPast
+                    let d2 = dates[b] ?? Date.distantPast
+                    if d1 > d2 { return .orderedAscending }
+                    if d1 < d2 { return .orderedDescending }
+                    return .orderedSame
+                }
+            ])
         }
     }
     

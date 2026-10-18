@@ -1,4 +1,5 @@
 import SwiftUI
+import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -10,6 +11,7 @@ public struct GalleryExplorerView: View {
     
     @State private var expandedYears: Set<Int> = []
     @State private var selectedSmartAlbum: SmartAlbumItem?
+    @State private var searchText: String = ""
     
     public init(coordinator: PhotoManagerCoordinator) {
         self.coordinator = coordinator
@@ -20,25 +22,54 @@ public struct GalleryExplorerView: View {
         GridItem(.flexible(), spacing: 12)
     ]
     
+    private var isSearching: Bool {
+        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+    }
+    
+    private var displayedAICategories: [AICategoryItem] {
+        if isSearching {
+            return coordinator.aiCategories.fuzzySearch(searchText, on: \.title).map(\.item)
+        } else {
+            return coordinator.aiCategories
+        }
+    }
+    
+    private var displayedUserAlbums: [UserAlbumItem] {
+        if isSearching {
+            return coordinator.userAlbums.fuzzySearch(searchText, on: \.title).map(\.item)
+        } else {
+            return coordinator.userAlbums
+        }
+    }
+    
     public var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
-                    // 1. AI Categorized Albums
-                    aiCategoriesSection
-                    
-                    // 2. User Albums (if any)
-                    if !coordinator.userAlbums.isEmpty {
-                        userAlbumsSection
+                    if isSearching && displayedAICategories.isEmpty && displayedUserAlbums.isEmpty {
+                        searchEmptyState
+                    } else {
+                        // 1. AI Categorized Albums
+                        if !displayedAICategories.isEmpty {
+                            aiCategoriesSection
+                        }
+                        
+                        // 2. User Albums (if any)
+                        if !displayedUserAlbums.isEmpty {
+                            userAlbumsSection
+                        }
+                        
+                        // 3. Chronological Timeline (Collapsible Years & Months)
+                        if !isSearching {
+                            timelineSection
+                        }
                     }
-                    
-                    // 3. Chronological Timeline (Collapsible Years & Months)
-                    timelineSection
                 }
                 .padding(16)
             }
             .background(Color.platformGroupedBackground)
             .navigationTitle("AI & Timeline")
+            .searchable(text: $searchText, prompt: "Search categories & albums…")
             .sheet(item: $selectedSmartAlbum) { album in
                 AlbumDetailListView(
                     item: album,
@@ -57,6 +88,23 @@ public struct GalleryExplorerView: View {
         }
     }
     
+    private var searchEmptyState: some View {
+        VStack(spacing: 12) {
+            Image(systemName: "magnifyingglass")
+                .font(.system(size: 44))
+                .foregroundColor(.secondary)
+            Text("No Results for \"\(searchText)\"")
+                .font(.headline)
+            Text("Try searching for categories like Nature, Animals, Vehicles, Food, or user albums.")
+                .font(.caption)
+                .foregroundColor(.secondary)
+                .multilineTextAlignment(.center)
+                .padding(.horizontal, 32)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.top, 60)
+    }
+    
     // MARK: - 1. AI Categorized Albums Section
     
     private var aiCategoriesSection: some View {
@@ -66,13 +114,13 @@ public struct GalleryExplorerView: View {
                     .font(.headline)
                     .foregroundColor(.primary)
                 Spacer()
-                Text("\(coordinator.aiCategories.count) Categories")
+                Text("\(displayedAICategories.count) Categories")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             
             LazyVGrid(columns: aiColumns, spacing: 12) {
-                ForEach(coordinator.aiCategories) { cat in
+                ForEach(displayedAICategories) { cat in
                     aiCategoryCard(cat)
                 }
             }
@@ -165,14 +213,14 @@ public struct GalleryExplorerView: View {
                 Label("My Albums", systemImage: "rectangle.stack.fill")
                     .font(.headline)
                 Spacer()
-                Text("\(coordinator.userAlbums.count) Albums")
+                Text("\(displayedUserAlbums.count) Albums")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
-                    ForEach(coordinator.userAlbums) { album in
+                    ForEach(displayedUserAlbums) { album in
                         Button {
                             selectedSmartAlbum = SmartAlbumItem(
                                 id: album.id,

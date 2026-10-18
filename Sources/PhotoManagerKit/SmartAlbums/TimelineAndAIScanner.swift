@@ -1,4 +1,5 @@
 import Foundation
+import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -15,40 +16,35 @@ public enum TimelineAndAIScanner {
         sizeRecords: [String: AssetSizeRecord] = [:]
     ) -> [YearSection] {
         let calendar = Calendar.current
-        var yearMap: [Int: [Int: [PHAsset]]] = [:]
         
-        for asset in photos {
-            let date = asset.creationDate ?? Date()
-            let comps = calendar.dateComponents([.year, .month], from: date)
-            guard let year = comps.year, let month = comps.month else { continue }
-            
-            if yearMap[year] == nil {
-                yearMap[year] = [:]
-            }
-            if yearMap[year]?[month] == nil {
-                yearMap[year]?[month] = []
-            }
-            yearMap[year]?[month]?.append(asset)
+        struct YearMonthKey: Hashable {
+            let year: Int
+            let month: Int
         }
         
+        // Fast functional bucketing via AlgorithmKit
+        let monthMap = photos.grouped { asset -> YearMonthKey in
+            let date = asset.creationDate ?? Date()
+            let comps = calendar.dateComponents([.year, .month], from: date)
+            return YearMonthKey(year: comps.year ?? 1970, month: comps.month ?? 1)
+        }
+        
+        let years = monthMap.keys.map(\.year).uniqued().sorted(by: >)
         let monthFormatter = DateFormatter()
         monthFormatter.locale = Locale.current
         
         var yearSections: [YearSection] = []
-        let sortedYears = yearMap.keys.sorted(by: >)
-        
-        for year in sortedYears {
-            guard let monthsInYear = yearMap[year] else { continue }
-            let sortedMonths = monthsInYear.keys.sorted(by: >)
+        for year in years {
+            let monthsInYear = monthMap.filter { $0.key.year == year }
+            let sortedMonths = monthsInYear.keys.map(\.month).sorted(by: >)
             
             var monthGroups: [MonthGroup] = []
             var yearTotalBytes: Int64 = 0
             var yearTotalCount = 0
             
             for m in sortedMonths {
-                guard let assets = monthsInYear[m], !assets.isEmpty else { continue }
-                
-                let monthName = monthFormatter.monthSymbols[m - 1]
+                guard let assets = monthMap[YearMonthKey(year: year, month: m)], !assets.isEmpty else { continue }
+                let monthName = (m >= 1 && m <= 12) ? monthFormatter.monthSymbols[m - 1] : "Month \(m)"
                 let ids = assets.map(\.localIdentifier)
                 let totalBytes = ids.reduce(0) { $0 + (sizeRecords[$1]?.totalBytes ?? 0) }
                 
@@ -62,7 +58,6 @@ public enum TimelineAndAIScanner {
                     count: assets.count,
                     totalBytes: totalBytes
                 )
-                
                 monthGroups.append(group)
                 yearTotalBytes += totalBytes
                 yearTotalCount += assets.count

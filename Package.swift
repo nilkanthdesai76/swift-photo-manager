@@ -18,14 +18,23 @@ let package = Package(
             targets: ["PhotoKitManager"]
         )
     ],
+    dependencies: [
+        .package(url: "https://github.com/nilkanthdesai76/AlgorithmKit.git", from: "1.0.0")
+    ],
     targets: [
         .target(
             name: "PhotoManagerKit",
+            dependencies: [
+                .product(name: "AlgorithmKit", package: "AlgorithmKit")
+            ],
             path: "Sources/PhotoManagerKit"
         ),
         .target(
             name: "PhotoKitManager",
-            dependencies: ["PhotoManagerKit"],
+            dependencies: [
+                "PhotoManagerKit",
+                .product(name: "AlgorithmKit", package: "AlgorithmKit")
+            ],
             path: "Sources/PhotoKitManager"
         ),
         .testTarget(
