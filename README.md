@@ -1,5 +1,7 @@
 # PhotoKitManager (PhotoManagerKit)
 
+> Looking for duplicate and similar photo detection? Start with [swift-vision-photo-dedupe](https://github.com/nilkanthdesai76/swift-vision-photo-dedupe). This repo covers library and storage management through PhotoKit.
+
 A high-performance, battery-conscious Apple PhotoKit library manager, storage calculator, duplicate cleaner, and AI categorization engine built for iOS 17+ and macOS 14+ using Swift and SwiftUI.
 
 [![Swift](https://img.shields.io/badge/Swift-5.9%2B-orange.svg)](https://swift.org)
