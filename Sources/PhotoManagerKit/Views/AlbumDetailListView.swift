@@ -1,5 +1,4 @@
 import SwiftUI
-import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -22,6 +21,8 @@ public struct AlbumDetailListView: View {
     @State private var selectedSort: AssetSortOrder = .latest
     @State private var selectedFilter: AssetTimeFilter = .all
     @State private var assetCreationDates: [String: Date] = [:]
+    @State private var thumbnailPrefetch = ThumbnailGridPrefetchState()
+    @State private var assetIndexByID: [String: Int] = [:]
     
     public init(
         item: SmartAlbumItem,
@@ -47,88 +48,47 @@ public struct AlbumDetailListView: View {
     }
     
     private var displayedAssetIDs: [String] {
-        let dates = assetCreationDates
-        let sizes = sizeRecords
-        
         // 1. Time range filter
         let filtered: [String]
         if showsTimeFilter && selectedFilter != .all {
             filtered = item.assetIDs.filter { id in
-                selectedFilter.matches(date: dates[id])
+                selectedFilter.matches(date: assetCreationDates[id])
             }
         } else {
             filtered = item.assetIDs
         }
         
-        // 2. Declarative MultiSort via AlgorithmKit
-        switch selectedSort {
-        case .latest:
-            return filtered.sorted(by: [
-                SortDescriptor { a, b in
-                    let d1 = dates[a] ?? Date.distantPast
-                    let d2 = dates[b] ?? Date.distantPast
-                    if d1 > d2 { return .orderedAscending }
-                    if d1 < d2 { return .orderedDescending }
-                    return .orderedSame
-                },
-                SortDescriptor { a, b in
-                    if a < b { return .orderedAscending }
-                    if a > b { return .orderedDescending }
-                    return .orderedSame
-                }
-            ])
-            
-        case .oldest:
-            return filtered.sorted(by: [
-                SortDescriptor { a, b in
-                    let d1 = dates[a] ?? Date.distantFuture
-                    let d2 = dates[b] ?? Date.distantFuture
-                    if d1 < d2 { return .orderedAscending }
-                    if d1 > d2 { return .orderedDescending }
-                    return .orderedSame
-                },
-                SortDescriptor { a, b in
-                    if a < b { return .orderedAscending }
-                    if a > b { return .orderedDescending }
-                    return .orderedSame
-                }
-            ])
-            
-        case .largest:
-            return filtered.sorted(by: [
-                SortDescriptor { a, b in
-                    let b1 = sizes[a]?.totalBytes ?? 0
-                    let b2 = sizes[b]?.totalBytes ?? 0
-                    if b1 > b2 { return .orderedAscending }
-                    if b1 < b2 { return .orderedDescending }
-                    return .orderedSame
-                },
-                SortDescriptor { a, b in
-                    let d1 = dates[a] ?? Date.distantPast
-                    let d2 = dates[b] ?? Date.distantPast
-                    if d1 > d2 { return .orderedAscending }
-                    if d1 < d2 { return .orderedDescending }
-                    return .orderedSame
-                }
-            ])
-            
-        case .smallest:
-            return filtered.sorted(by: [
-                SortDescriptor { a, b in
-                    let b1 = sizes[a]?.totalBytes ?? 0
-                    let b2 = sizes[b]?.totalBytes ?? 0
-                    if b1 < b2 { return .orderedAscending }
-                    if b1 > b2 { return .orderedDescending }
-                    return .orderedSame
-                },
-                SortDescriptor { a, b in
-                    let d1 = dates[a] ?? Date.distantPast
-                    let d2 = dates[b] ?? Date.distantPast
-                    if d1 > d2 { return .orderedAscending }
-                    if d1 < d2 { return .orderedDescending }
-                    return .orderedSame
-                }
-            ])
+        // 2. Sorting
+        return filtered.sorted { id1, id2 in
+            switch selectedSort {
+            case .latest:
+                let d1 = assetCreationDates[id1] ?? Date.distantPast
+                let d2 = assetCreationDates[id2] ?? Date.distantPast
+                if d1 != d2 { return d1 > d2 }
+                return id1 < id2
+                
+            case .oldest:
+                let d1 = assetCreationDates[id1] ?? Date.distantFuture
+                let d2 = assetCreationDates[id2] ?? Date.distantFuture
+                if d1 != d2 { return d1 < d2 }
+                return id1 < id2
+                
+            case .largest:
+                let b1 = sizeRecords[id1]?.totalBytes ?? 0
+                let b2 = sizeRecords[id2]?.totalBytes ?? 0
+                if b1 != b2 { return b1 > b2 }
+                let d1 = assetCreationDates[id1] ?? Date.distantPast
+                let d2 = assetCreationDates[id2] ?? Date.distantPast
+                return d1 > d2
+                
+            case .smallest:
+                let b1 = sizeRecords[id1]?.totalBytes ?? 0
+                let b2 = sizeRecords[id2]?.totalBytes ?? 0
+                if b1 != b2 { return b1 < b2 }
+                let d1 = assetCreationDates[id1] ?? Date.distantPast
+                let d2 = assetCreationDates[id2] ?? Date.distantPast
+                return d1 < d2
+            }
         }
     }
     
@@ -179,9 +139,34 @@ public struct AlbumDetailListView: View {
                         LazyVGrid(columns: columns, spacing: 4) {
                             ForEach(displayedAssetIDs, id: \.self) { assetID in
                                 assetCell(assetID)
+                                    .onAppear {
+                                        guard let index = assetIndexByID[assetID] else { return }
+                                        thumbnailPrefetch.updateWindow(
+                                            around: index,
+                                            assetIDs: displayedAssetIDs,
+                                            targetSize: PMKAssetThumbnailView.gridRequestSize
+                                        )
+                                    }
                             }
                         }
                         .padding(4)
+                    }
+                    .onAppear {
+                        rebuildAssetIndexLookup()
+                        thumbnailPrefetch.prefetchInitial(
+                            assetIDs: displayedAssetIDs,
+                            targetSize: PMKAssetThumbnailView.gridRequestSize
+                        )
+                    }
+                    .onChange(of: displayedAssetIDs) { _, ids in
+                        rebuildAssetIndexLookup()
+                        thumbnailPrefetch.prefetchInitial(
+                            assetIDs: ids,
+                            targetSize: PMKAssetThumbnailView.gridRequestSize
+                        )
+                    }
+                    .onDisappear {
+                        thumbnailPrefetch.stopAll(targetSize: PMKAssetThumbnailView.gridRequestSize)
                     }
                     
                     if isSelectionMode && !selectedIDs.isEmpty {
@@ -345,10 +330,18 @@ public struct AlbumDetailListView: View {
         #endif
     }
     
+    private func rebuildAssetIndexLookup() {
+        let ids = displayedAssetIDs
+        var lookup: [String: Int] = [:]
+        lookup.reserveCapacity(ids.count)
+        for (index, id) in ids.enumerated() { lookup[id] = index }
+        assetIndexByID = lookup
+    }
+
     private func assetCell(_ id: String) -> some View {
         let isSelected = selectedIDs.contains(id)
         return ZStack(alignment: .topTrailing) {
-            AssetThumbnailView(assetID: id)
+            PMKAssetThumbnailView(assetID: id)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     if isSelectionMode {

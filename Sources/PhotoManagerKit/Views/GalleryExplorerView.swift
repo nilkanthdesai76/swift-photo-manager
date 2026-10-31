@@ -1,5 +1,4 @@
 import SwiftUI
-import AlgorithmKit
 
 #if canImport(Photos)
 import Photos
@@ -8,11 +7,20 @@ import Photos
 /// Second tab view presenting AI-categorized photo albums, user albums, and collapsible chronological Year-Month timeline.
 public struct GalleryExplorerView: View {
     public var coordinator: PhotoManagerCoordinator
-    
+
     @State private var expandedYears: Set<Int> = []
     @State private var selectedSmartAlbum: SmartAlbumItem?
-    @State private var searchText: String = ""
-    
+    @State private var coverPrefetch = ThumbnailGridPrefetchState(
+        deliveryMode: .opportunistic,
+        allowsNetworkAccess: false
+    )
+    @State private var coverIndexByID: [String: Int] = [:]
+
+    /// Covers render at card sizes above the grid threshold, so they load with
+    /// the opportunistic local-only profile — one shared request size keeps them
+    /// cacheable and matches the cover prefetch window below.
+    private let coverRequestSize = CGSize(width: 260, height: 260)
+
     public init(coordinator: PhotoManagerCoordinator) {
         self.coordinator = coordinator
     }
@@ -22,54 +30,25 @@ public struct GalleryExplorerView: View {
         GridItem(.flexible(), spacing: 12)
     ]
     
-    private var isSearching: Bool {
-        !searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-    }
-    
-    private var displayedAICategories: [AICategoryItem] {
-        if isSearching {
-            return coordinator.aiCategories.fuzzySearch(searchText, on: \.title).map(\.item)
-        } else {
-            return coordinator.aiCategories
-        }
-    }
-    
-    private var displayedUserAlbums: [UserAlbumItem] {
-        if isSearching {
-            return coordinator.userAlbums.fuzzySearch(searchText, on: \.title).map(\.item)
-        } else {
-            return coordinator.userAlbums
-        }
-    }
-    
     public var body: some View {
         NavigationStack {
             ScrollView {
                 VStack(spacing: 24) {
-                    if isSearching && displayedAICategories.isEmpty && displayedUserAlbums.isEmpty {
-                        searchEmptyState
-                    } else {
-                        // 1. AI Categorized Albums
-                        if !displayedAICategories.isEmpty {
-                            aiCategoriesSection
-                        }
-                        
-                        // 2. User Albums (if any)
-                        if !displayedUserAlbums.isEmpty {
-                            userAlbumsSection
-                        }
-                        
-                        // 3. Chronological Timeline (Collapsible Years & Months)
-                        if !isSearching {
-                            timelineSection
-                        }
+                    // 1. AI Categorized Albums
+                    aiCategoriesSection
+                    
+                    // 2. User Albums (if any)
+                    if !coordinator.userAlbums.isEmpty {
+                        userAlbumsSection
                     }
+                    
+                    // 3. Chronological Timeline (Collapsible Years & Months)
+                    timelineSection
                 }
                 .padding(16)
             }
             .background(Color.platformGroupedBackground)
             .navigationTitle("AI & Timeline")
-            .searchable(text: $searchText, prompt: "Search categories & albums…")
             .sheet(item: $selectedSmartAlbum) { album in
                 AlbumDetailListView(
                     item: album,
@@ -84,25 +63,23 @@ public struct GalleryExplorerView: View {
                 if expandedYears.isEmpty, let firstYear = coordinator.yearSections.first?.year {
                     expandedYears.insert(firstYear)
                 }
+                rebuildCoverIndexLookup()
+                coverPrefetch.prefetchInitial(
+                    assetIDs: coverAssetIDs,
+                    targetSize: coverRequestSize
+                )
+            }
+            .onChange(of: coverAssetIDs) { _, ids in
+                rebuildCoverIndexLookup()
+                coverPrefetch.prefetchInitial(
+                    assetIDs: ids,
+                    targetSize: coverRequestSize
+                )
+            }
+            .onDisappear {
+                coverPrefetch.stopAll(targetSize: coverRequestSize)
             }
         }
-    }
-    
-    private var searchEmptyState: some View {
-        VStack(spacing: 12) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 44))
-                .foregroundColor(.secondary)
-            Text("No Results for \"\(searchText)\"")
-                .font(.headline)
-            Text("Try searching for categories like Nature, Animals, Vehicles, Food, or user albums.")
-                .font(.caption)
-                .foregroundColor(.secondary)
-                .multilineTextAlignment(.center)
-                .padding(.horizontal, 32)
-        }
-        .frame(maxWidth: .infinity)
-        .padding(.top, 60)
     }
     
     // MARK: - 1. AI Categorized Albums Section
@@ -114,13 +91,13 @@ public struct GalleryExplorerView: View {
                     .font(.headline)
                     .foregroundColor(.primary)
                 Spacer()
-                Text("\(displayedAICategories.count) Categories")
+                Text("\(coordinator.aiCategories.count) Categories")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             
             LazyVGrid(columns: aiColumns, spacing: 12) {
-                ForEach(displayedAICategories) { cat in
+                ForEach(coordinator.aiCategories) { cat in
                     aiCategoryCard(cat)
                 }
             }
@@ -144,9 +121,10 @@ public struct GalleryExplorerView: View {
                 // 1:1 Album Cover Preview
                 ZStack(alignment: .topTrailing) {
                     if let coverID = cat.coverAssetID {
-                        AssetThumbnailView(assetID: coverID)
+                        PMKAssetThumbnailView(assetID: coverID, targetSize: coverRequestSize)
                             .aspectRatio(1, contentMode: .fit)
                             .clipped()
+                            .onAppear { updateCoverWindow(for: coverID) }
                     } else {
                         Rectangle()
                             .fill(
@@ -213,14 +191,14 @@ public struct GalleryExplorerView: View {
                 Label("My Albums", systemImage: "rectangle.stack.fill")
                     .font(.headline)
                 Spacer()
-                Text("\(displayedUserAlbums.count) Albums")
+                Text("\(coordinator.userAlbums.count) Albums")
                     .font(.caption)
                     .foregroundColor(.secondary)
             }
             
             ScrollView(.horizontal, showsIndicators: false) {
                 HStack(spacing: 12) {
-                    ForEach(displayedUserAlbums) { album in
+                    ForEach(coordinator.userAlbums) { album in
                         Button {
                             selectedSmartAlbum = SmartAlbumItem(
                                 id: album.id,
@@ -235,9 +213,10 @@ public struct GalleryExplorerView: View {
                         } label: {
                             VStack(alignment: .leading, spacing: 6) {
                                 if let cover = album.coverAssetID {
-                                    AssetThumbnailView(assetID: cover)
+                                    PMKAssetThumbnailView(assetID: cover, targetSize: coverRequestSize)
                                         .frame(width: 120, height: 120)
                                         .cornerRadius(12)
+                                        .onAppear { updateCoverWindow(for: cover) }
                                 } else {
                                     RoundedRectangle(cornerRadius: 12)
                                         .fill(Color.gray.opacity(0.2))
@@ -336,9 +315,10 @@ public struct GalleryExplorerView: View {
                         } label: {
                             HStack(spacing: 12) {
                                 if let cover = month.coverAssetID {
-                                    AssetThumbnailView(assetID: cover)
+                                    PMKAssetThumbnailView(assetID: cover, targetSize: coverRequestSize)
                                         .frame(width: 48, height: 48)
                                         .cornerRadius(8)
+                                        .onAppear { updateCoverWindow(for: cover) }
                                 } else {
                                     RoundedRectangle(cornerRadius: 8)
                                         .fill(Color.gray.opacity(0.2))
@@ -391,5 +371,42 @@ public struct GalleryExplorerView: View {
         case "yellow": return .yellow
         default: return .blue
         }
+    }
+
+    // MARK: - Cover prefetch
+
+    /// Cover asset IDs in display order — the sliding window is positioned by a
+    /// cover's index in this flat list.
+    private var coverAssetIDs: [String] {
+        var ids: [String] = []
+        for category in coordinator.aiCategories {
+            if let cover = category.coverAssetID { ids.append(cover) }
+        }
+        for album in coordinator.userAlbums {
+            if let cover = album.coverAssetID { ids.append(cover) }
+        }
+        for section in coordinator.yearSections {
+            for month in section.months {
+                if let cover = month.coverAssetID { ids.append(cover) }
+            }
+        }
+        return ids
+    }
+
+    private func rebuildCoverIndexLookup() {
+        let ids = coverAssetIDs
+        var lookup: [String: Int] = [:]
+        lookup.reserveCapacity(ids.count)
+        for (index, id) in ids.enumerated() { lookup[id] = index }
+        coverIndexByID = lookup
+    }
+
+    private func updateCoverWindow(for assetID: String) {
+        guard let index = coverIndexByID[assetID] else { return }
+        coverPrefetch.updateWindow(
+            around: index,
+            assetIDs: coverAssetIDs,
+            targetSize: coverRequestSize
+        )
     }
 }

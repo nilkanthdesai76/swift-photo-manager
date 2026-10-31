@@ -14,6 +14,8 @@ public struct GroupReviewView: View {
     @State private var isDeleting = false
     @State private var showDeleteConfirmation = false
     @State private var selectedDetailAssetID: String?
+    @State private var thumbnailPrefetch = ThumbnailGridPrefetchState()
+    @State private var itemIndexByID: [String: Int] = [:]
     
     public init(
         title: String,
@@ -61,6 +63,23 @@ public struct GroupReviewView: View {
                             }
                         }
                         .padding(16)
+                    }
+                    .onAppear {
+                        rebuildItemIndexLookup()
+                        thumbnailPrefetch.prefetchInitial(
+                            assetIDs: allItemIDs,
+                            targetSize: PMKAssetThumbnailView.gridRequestSize
+                        )
+                    }
+                    .onChange(of: allItemIDs) { _, ids in
+                        rebuildItemIndexLookup()
+                        thumbnailPrefetch.prefetchInitial(
+                            assetIDs: ids,
+                            targetSize: PMKAssetThumbnailView.gridRequestSize
+                        )
+                    }
+                    .onDisappear {
+                        thumbnailPrefetch.stopAll(targetSize: PMKAssetThumbnailView.gridRequestSize)
                     }
                     
                     // Bottom Clean Bar
@@ -152,6 +171,14 @@ public struct GroupReviewView: View {
             LazyVGrid(columns: gridColumns, spacing: 8) {
                 ForEach(group.items) { $item in
                     gridPhotoCell(item: $item, bestID: group.wrappedValue.bestAssetID)
+                        .onAppear {
+                            guard let index = itemIndexByID[$item.wrappedValue.id] else { return }
+                            thumbnailPrefetch.updateWindow(
+                                around: index,
+                                assetIDs: allItemIDs,
+                                targetSize: PMKAssetThumbnailView.gridRequestSize
+                            )
+                        }
                 }
             }
         }
@@ -166,7 +193,7 @@ public struct GroupReviewView: View {
         
         return ZStack(alignment: .topTrailing) {
             // Photo Thumbnail (Tap to open full photo details)
-            AssetThumbnailView(assetID: item.wrappedValue.id)
+            PMKAssetThumbnailView(assetID: item.wrappedValue.id)
                 .contentShape(Rectangle())
                 .onTapGesture {
                     selectedDetailAssetID = item.wrappedValue.id
@@ -276,6 +303,20 @@ public struct GroupReviewView: View {
         }
     }
     
+    /// Every reviewable item across all groups, in display order — the sliding
+    /// prefetch window is positioned by a cell's index in this flat list.
+    private var allItemIDs: [String] {
+        groups.flatMap { $0.items.map(\.id) }
+    }
+
+    private func rebuildItemIndexLookup() {
+        let ids = allItemIDs
+        var lookup: [String: Int] = [:]
+        lookup.reserveCapacity(ids.count)
+        for (index, id) in ids.enumerated() { lookup[id] = index }
+        itemIndexByID = lookup
+    }
+
     private func autoSelectBest() {
         for i in 0..<groups.count {
             let best = groups[i].bestAssetID

@@ -229,11 +229,15 @@ public enum SimilarityPreset: String, CaseIterable, Identifiable, Sendable {
     public var id: String { rawValue }
     
     /// Max Hamming distance between hashes to count as "similar".
+    /// Tightened after the 26-bit experiment over-merged real libraries:
+    /// same-scene siblings split at 16–23 bits, junk crept in from the low
+    /// 20s upward. 20 keeps most genuine bursts reachable while the low 20s
+    /// junk zone stays out; Strict goes tighter still for conservative runs.
     public var hammingThreshold: Int {
         switch self {
-        case .strict: return 5
-        case .balanced: return 8
-        case .relaxed: return 12
+        case .strict: return 14
+        case .balanced: return 20
+        case .relaxed: return 26
         }
     }
     

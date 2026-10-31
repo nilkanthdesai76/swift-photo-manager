@@ -241,15 +241,10 @@ private struct PhotoCleanupSuggestionsSection: View {
     let onSelectAlbum: (SmartAlbumItem) -> Void
     
     var body: some View {
-        if coordinator.topHeaviestAlbum != nil || coordinator.largePhotosAlbum != nil || coordinator.oldPhotosAlbum != nil || coordinator.blurryPhotosAlbum != nil {
+        if coordinator.largePhotosAlbum != nil || coordinator.oldPhotosAlbum != nil || coordinator.blurryPhotosAlbum != nil {
             VStack(spacing: 8) {
-                let itemCount = [coordinator.topHeaviestAlbum, coordinator.largePhotosAlbum, coordinator.oldPhotosAlbum, coordinator.blurryPhotosAlbum].compactMap { $0 }.count
+                let itemCount = [coordinator.largePhotosAlbum, coordinator.oldPhotosAlbum, coordinator.blurryPhotosAlbum].compactMap { $0 }.count
                 sectionHeader(title: "Cleanup Suggestions", count: itemCount)
-                if let heaviest = coordinator.topHeaviestAlbum {
-                    SmartAlbumCardView(item: heaviest) {
-                        onSelectAlbum(heaviest)
-                    }
-                }
                 if let large = coordinator.largePhotosAlbum {
                     SmartAlbumCardView(item: large) {
                         onSelectAlbum(large)

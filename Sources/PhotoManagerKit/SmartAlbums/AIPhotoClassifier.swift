@@ -13,6 +13,7 @@ import UIKit
 #elseif canImport(AppKit)
 import AppKit
 #endif
+import CoreImage
 
 /// Real on-device AI scene & object classifier using Apple's Vision framework (VNClassifyImageRequest).
 /// Strictly assigns semantic taxonomies; NEVER uses random modulo hashing.
@@ -142,31 +143,223 @@ public enum AIPhotoClassifier {
     #endif
     
     #if canImport(Photos)
-    /// Classifies a PHAsset by combining system metadata and Vision scene classification.
-    public static func classify(asset: PHAsset) -> String? {
-        // 1. Instant metadata classification
-        if asset.mediaSubtypes.contains(.photoScreenshot) {
-            return "ai_docs"
+    /// Classification result for one photo: the AI category plus a blur flag
+    /// computed from the same decoded thumbnail. `isBlurry` is nil when the
+    /// delivered image is not trustworthy for blur evaluation (iCloud-only
+    /// assets can surface a small on-device surrogate that PhotoKit does not
+    /// mark degraded under `.fastFormat`) — callers must not flag the asset
+    /// in either direction in that case.
+    public struct ClassificationResult: Sendable {
+        public let category: String
+        public let isBlurry: Bool?
+
+        public init(category: String, isBlurry: Bool?) {
+            self.category = category
+            self.isBlurry = isBlurry
         }
+    }
+
+    /// Classifies a PHAsset with the full main-branch pipeline: instant metadata
+    /// fast paths, Tier-1 `VNClassifyImageRequest` with screenshot/document
+    /// fast exits, then gated Tier-2 face/animal detectors feeding the
+    /// evidence-fusion mapper. Every photo resolves to a category —
+    /// unclassifiable photos land in `ai_others` (hidden from the rail) so the
+    /// AI albums cover the whole library like the Gallery pipeline did.
+    ///
+    /// Blur uses the main-branch CIEdges score on the same thumbnail AI sort
+    /// already decodes — no separate blur scan.
+    public static func classify(asset: PHAsset) -> ClassificationResult {
+        // 1. Instant metadata classification. Blur still runs on that thumbnail.
+        // Screenshots are not AI-classified — the AI rail uses the system album only.
         if asset.mediaSubtypes.contains(.photoDepthEffect) {
-            return "ai_people"
+            return ClassificationResult(
+                category: AIPhotoCategory.people.pmkCacheID,
+                isBlurry: edgeBlurFlag(for: asset)
+            )
         }
         if asset.mediaSubtypes.contains(.photoPanorama) {
-            return "ai_nature"
+            return ClassificationResult(
+                category: AIPhotoCategory.nature.pmkCacheID,
+                isBlurry: edgeBlurFlag(for: asset)
+            )
         }
-        
+
         #if canImport(Vision)
-        // 2. Fetch fast 128px embedded thumbnail for Vision classification
         guard let cgImage = loadFastThumbnailCGImage(for: asset) else {
-            return nil
+            return ClassificationResult(category: AIPhotoCategory.others.pmkCacheID, isBlurry: false)
         }
-        return classify(cgImage: cgImage)
+        let isBlurry: Bool? = computeBlurFlag(cgImage: cgImage)
+
+        let classifyRequest = VNClassifyImageRequest()
+        let handler = VNImageRequestHandler(cgImage: cgImage, options: [:])
+
+        do {
+            // Tier-1 scene classifier (~4-5 ms on ANE)
+            try handler.perform([classifyRequest])
+            guard let observations = classifyRequest.results else {
+                return ClassificationResult(category: AIPhotoCategory.others.pmkCacheID, isBlurry: isBlurry)
+            }
+
+            let labelResults = observations
+                .filter { $0.confidence > 0.01 }
+                .map { VisionLabelResult(label: $0.identifier, confidence: $0.confidence) }
+
+            // Fast-exit for clear documents before Tier-2 (screenshots are system-album only).
+            var maxDocumentConfidence: Float = 0
+            var maxAnimalConfidence: Float = 0
+            var maxPeopleConfidence: Float = 0
+
+            for result in labelResults {
+                let label = result.label.lowercased()
+                if label == "document" || label == "printed_page" {
+                    maxDocumentConfidence = max(maxDocumentConfidence, result.confidence)
+                }
+                if PMKAIPhotoCategoryMapper.animalClueKeywords.contains(label) {
+                    maxAnimalConfidence = max(maxAnimalConfidence, result.confidence)
+                }
+                if PMKAIPhotoCategoryMapper.peopleClueKeywords.contains(label) {
+                    maxPeopleConfidence = max(maxPeopleConfidence, result.confidence)
+                }
+            }
+
+            if maxDocumentConfidence >= 0.40 && maxAnimalConfidence < 0.03 && maxPeopleConfidence < 0.06 {
+                return ClassificationResult(
+                    category: PMKAIPhotoCategoryMapper.map(
+                        labels: labelResults,
+                        isScreenshotAsset: false,
+                        documentTextCoverage: 0,
+                        faceCount: 0,
+                        animalDetected: false
+                    ).category.pmkCacheID,
+                    isBlurry: isBlurry
+                )
+            }
+
+            // Tier-2 detectors only run when the labels justify them.
+            let needsAnimalDetector = maxAnimalConfidence >= 0.03
+            let needsFaceDetector = maxPeopleConfidence >= 0.06
+
+            let faceRequest = VNDetectFaceRectanglesRequest()
+            let animalRequest = VNRecognizeAnimalsRequest()
+
+            var secondaryRequests: [VNRequest] = []
+            if needsFaceDetector {
+                secondaryRequests.append(faceRequest)
+            }
+            if needsAnimalDetector {
+                secondaryRequests.append(animalRequest)
+            }
+            if !secondaryRequests.isEmpty {
+                try handler.perform(secondaryRequests)
+            }
+
+            let faceCount: Int = needsFaceDetector ? (faceRequest.results?.count ?? 0) : 0
+            let animalDetected: Bool
+            if needsAnimalDetector, let animalResults = animalRequest.results as? [VNRecognizedObjectObservation] {
+                animalDetected = !animalResults.isEmpty
+            } else {
+                animalDetected = false
+            }
+
+            return ClassificationResult(
+                category: PMKAIPhotoCategoryMapper.map(
+                    labels: labelResults,
+                    isScreenshotAsset: false,
+                    documentTextCoverage: 0,
+                    faceCount: faceCount,
+                    animalDetected: animalDetected
+                ).category.pmkCacheID,
+                isBlurry: isBlurry
+            )
+        } catch {
+            return ClassificationResult(category: AIPhotoCategory.others.pmkCacheID, isBlurry: isBlurry)
+        }
         #else
-        return nil
+        return ClassificationResult(category: AIPhotoCategory.others.pmkCacheID, isBlurry: false)
         #endif
     }
+
+    /// Main-branch blur: CIEdges at 96px, intensity 10. Lower score = blurrier.
+    /// Photos under `blurThreshold` (0.16) are the blur group. Near-black
+    /// frames return infinity so they are not flagged.
+    private static let blurThreshold: Float = 0.16
+    private static let blurCIContext = CIContext(options: [.cacheIntermediates: false])
+
+    /// nil when the thumbnail never arrived — do not treat that as sharp or blurry.
+    private static func edgeBlurFlag(for asset: PHAsset) -> Bool? {
+        guard let cgImage = loadFastThumbnailCGImage(for: asset) else { return nil }
+        return computeBlurFlag(cgImage: cgImage)
+    }
+
+    private static func computeBlurFlag(cgImage: CGImage) -> Bool {
+        let score = computeBlurScore(for: CIImage(cgImage: cgImage))
+        return score < blurThreshold
+    }
+
+    /// Same statistic as main .
+    private static func computeBlurScore(for fullImage: CIImage) -> Float {
+        let maxSide = max(fullImage.extent.width, fullImage.extent.height)
+        let targetSide: CGFloat = 96
+        let ciImage: CIImage
+        if maxSide > targetSide {
+            let scale = targetSide / maxSide
+            ciImage = fullImage.transformed(by: CGAffineTransform(scaleX: scale, y: scale))
+        } else {
+            ciImage = fullImage
+        }
+
+        if meanLuminance(of: ciImage) < 0.06 {
+            return .infinity
+        }
+
+        let edgesFilter = CIFilter(name: "CIEdges")
+        edgesFilter?.setValue(ciImage, forKey: kCIInputImageKey)
+        edgesFilter?.setValue(10.0, forKey: kCIInputIntensityKey)
+        guard let edgesImage = edgesFilter?.outputImage else { return .infinity }
+
+        let avgFilter = CIFilter(name: "CIAreaAverage")
+        avgFilter?.setValue(edgesImage, forKey: kCIInputImageKey)
+        avgFilter?.setValue(CIVector(cgRect: ciImage.extent), forKey: kCIInputExtentKey)
+        guard let output = avgFilter?.outputImage else { return .infinity }
+
+        var result: [Float] = [0, 0, 0, 0]
+        blurCIContext.render(
+            output,
+            toBitmap: &result,
+            rowBytes: 16,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBAf,
+            colorSpace: nil
+        )
+        return result[0] + result[1] + result[2]
+    }
+
+    private static func meanLuminance(of ciImage: CIImage) -> Float {
+        let avgFilter = CIFilter(name: "CIAreaAverage")
+        avgFilter?.setValue(ciImage, forKey: kCIInputImageKey)
+        avgFilter?.setValue(CIVector(cgRect: ciImage.extent), forKey: kCIInputExtentKey)
+        guard let output = avgFilter?.outputImage else { return 1 }
+        var result: [Float] = [0, 0, 0, 0]
+        blurCIContext.render(
+            output,
+            toBitmap: &result,
+            rowBytes: 16,
+            bounds: CGRect(x: 0, y: 0, width: 1, height: 1),
+            format: .RGBAf,
+            colorSpace: nil
+        )
+        return 0.2126 * result[0] + 0.7152 * result[1] + 0.0722 * result[2]
+    }
+
+    /// Blur-only pass for photos whose AI category is already cached.
+    /// nil means the thumbnail was not delivered.
+    public static func evaluateBlurOnly(asset: PHAsset) -> Bool? {
+        edgeBlurFlag(for: asset)
+    }
     
-    private static let targetSize = CGSize(width: 128, height: 128)
+    /// 192px serves both the Vision classifier and the blur-energy check on
+    /// the same decoded thumbnail.
+    private static let targetSize = CGSize(width: 192, height: 192)
     private static let imageOptions: PHImageRequestOptions = {
         let opt = PHImageRequestOptions()
         opt.deliveryMode = .fastFormat
@@ -176,6 +369,24 @@ public enum AIPhotoClassifier {
         return opt
     }()
     
+    /// Some PhotoKit deliveries have no `cgImage` until they are drawn.
+    private static func renderedCGImage(from image: PlatformImage) -> CGImage? {
+        #if canImport(UIKit)
+        let format = UIGraphicsImageRendererFormat()
+        format.scale = 1
+        format.opaque = true
+        let renderer = UIGraphicsImageRenderer(size: targetSize, format: format)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }.cgImage
+        #elseif canImport(AppKit)
+        var rect = CGRect(origin: .zero, size: targetSize)
+        return image.cgImage(forProposedRect: &rect, context: nil, hints: nil)
+        #else
+        return nil
+        #endif
+    }
+
     private static func loadFastThumbnailCGImage(for asset: PHAsset) -> CGImage? {
         var resultCGImage: CGImage?
         PHImageManager.default().requestImage(
@@ -186,11 +397,7 @@ public enum AIPhotoClassifier {
         ) { image, info in
             let isDegraded = (info?[PHImageResultIsDegradedKey] as? Bool) ?? false
             if !isDegraded, let img = image {
-                #if canImport(UIKit)
-                resultCGImage = img.cgImage
-                #elseif canImport(AppKit)
-                resultCGImage = img.cgImage(forProposedRect: nil, context: nil, hints: nil)
-                #endif
+                resultCGImage = Self.renderedCGImage(from: img)
             }
         }
         return resultCGImage

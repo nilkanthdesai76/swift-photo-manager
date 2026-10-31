@@ -205,7 +205,7 @@ public struct ProcessDashboardView: View {
             .refreshable {
                 await refreshStats()
             }
-            .onChange(of: coordinator.similarityPreset) {
+            .onChange(of: coordinator.similarityPreset) { _ in
                 flash("Strictness updated — applies to the next scan")
             }
             .alert("Clear All Caches?", isPresented: $showClearAllConfirmation) {

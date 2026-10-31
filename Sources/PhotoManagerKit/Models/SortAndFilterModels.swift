@@ -29,6 +29,7 @@ public enum AssetTimeFilter: String, CaseIterable, Identifiable, Sendable {
     case lastYear = "Last year"
     
     public var id: String { rawValue }
+    public var title: String { rawValue }
     
     /// Evaluates if the asset's creationDate satisfies the time period.
     public func matches(date: Date?) -> Bool {
